@@ -36,7 +36,7 @@ AMINO_ACIDS = [
     "Y",
     "V",
 ]
-RESIDUE_ALPHABET = ["[PAD]", "[CLS]", "[SEP]", "[UNK]", "[MASK]"] + AMINO_ACIDS + ["0"]
+RESIDUE_ALPHABET = ["[PAD]", "[CLS]", "[UNK]", "[MASK]", "[SEP]"] + AMINO_ACIDS + ["0"]
 
 
 class IntTokenizer:
@@ -57,8 +57,9 @@ class IntTokenizer:
         self.special_idxs = [self.convert_token_to_id(t) for t in self.special_vocab]
 
     @cached(cache=LRUCache(maxsize=int(1e4)))
-    def encode(self, seq):
-        seq = ["[CLS]"] + list(seq) + ["[SEP]"]
+    def encode(self, seq, use_sep=True):
+        seq = ["[CLS]"] + list(seq)
+        seq += ["[SEP]"] if use_sep else []
         return [self.convert_token_to_id(c) for c in seq]
 
     def decode(self, token_ids):

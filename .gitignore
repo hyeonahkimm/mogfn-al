@@ -12,3 +12,8 @@ lambo/assets/fpbase/proxy-rfp-task*
 hydra_config/hydra/launcher/ray_aws.yaml
 .idea
 *checkpoint.ipynb
+*__pycache__
+*egg-info
+data
+env/
+slurm-*

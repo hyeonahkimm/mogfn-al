@@ -347,6 +347,7 @@ class LaMBO(object):
             base_seqs = np.array([b_cand.mutant_residue_seq for b_cand in base_candidates])
             new_seqs = new_seq_batches[best_batch_idx]
             # new_tokens = new_tok_batches[best_batch_idx]
+            import pdb; pdb.set_trace();
 
             # logging
             metrics = dict(

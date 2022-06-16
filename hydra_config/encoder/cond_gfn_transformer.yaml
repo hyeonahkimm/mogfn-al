@@ -1,0 +1,10 @@
+_target_: lambo.models.cond_gfn_transformer.CondGFNTransformer
+max_len: ${task.max_len}
+vocab_size: 26
+num_actions: 21
+num_hid: 64
+num_layers: 5
+num_head: 8
+bidirectional: False
+dropout: 0
+batch_size: 32

@@ -71,7 +71,10 @@ class RegexTask(BaseTask):
         out["F"] = self.transform(self.score(x_cands))
 
     def score(self, candidates):
-        str_array = np.array([cand.mutant_residue_seq for cand in candidates])
+        if type(candidates[0]) == StringCandidate:
+            str_array = np.array([cand.mutant_residue_seq for cand in candidates])
+        else:
+            str_array = np.array(candidates)
         scores = []
         for regex in self.regex_list:
             scores.append(np.array([
