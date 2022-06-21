@@ -102,6 +102,7 @@ class MOGFN(object):
 
     def optimize(self, candidate_pool, pool_targets, all_seqs, all_targets, log_prefix=''):
         batch_size = self.bb_task.batch_size
+        all_targets = -all_targets
         target_min = all_targets.min(axis=0).copy()
         target_range = all_targets.max(axis=0).copy() - target_min
         hypercube_transform = Normalizer(
@@ -272,8 +273,8 @@ class MOGFN(object):
 
     def val_step(self, batch_size, pref_alpha, temp_shape, temp_scale):
         # import pdb; pdb.set_trace();
-        prefs = np.random.dirichlet([pref_alpha]*self.num_props)
-        temp = np.random.gamma(temp_shape, temp_scale)
+        prefs = self.simplex[0]# np.random.dirichlet([pref_alpha]*self.num_props)
+        temp = 2
         if self.pref_use_therm:
             prefs_enc = thermometer(torch.from_numpy(prefs), self.therm_n_bins, 0, 1)
         if self.temp_use_therm:
@@ -293,6 +294,7 @@ class MOGFN(object):
             with torch.no_grad():
                 logits = self.model(x, torch.tile(cond_var, (1, x.shape[1], 1)), mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
             seq_logits = (logits.reshape(-1, 21)[torch.arange(x.shape[0] * x.shape[1], device=self.device), (x.reshape(-1)-4).clamp(0)].reshape(x.shape) * mask[1:, :].logical_not().float()).sum(0)
+            seq_logits += self.model.Z(cond_var)
             r = self.process_reward(self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size], prefs, temp).to(seq_logits.device)
             loss = (seq_logits - temp * r.clamp(min=self.reward_min).log()).pow(2).mean()
 

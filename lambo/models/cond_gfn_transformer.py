@@ -42,6 +42,8 @@ class CondGFNTransformer(nn.Module):
         if return_all:
             if logsoftmax:
                 return self.logsoftmax2(self.output(x)[1:])
+            else:
+                return self.output(x)[1:]
         y = self.output(pooled_x)
         return y
 
