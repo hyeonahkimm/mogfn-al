@@ -16,6 +16,7 @@ class CondGFNTransformer(nn.Module):
         self.output = nn.Linear(num_hid, num_actions)
         self.causal = not bidirectional
         self.Z_mod = nn.Linear(cond_dim, 64)
+        self.logsoftmax2 = torch.nn.LogSoftmax(2)
 
     def Z(self, cond_var):
         return self.Z_mod(cond_var).sum()
@@ -27,7 +28,7 @@ class CondGFNTransformer(nn.Module):
     def Z_param(self):
         return self.Z_mod.parameters()
 
-    def forward(self, x, cond, mask, return_all=False, lens=None):
+    def forward(self, x, cond, mask, return_all=False, lens=None, logsoftmax=False):
         cond_var = self.cond_embed(cond)
         x = self.embedding(x)
         x = self.pos(x)
@@ -37,9 +38,10 @@ class CondGFNTransformer(nn.Module):
             pooled_x = x[lens+1, torch.arange(x.shape[1])]
         else:
             x = self.encoder(x, src_key_padding_mask=mask)
-            pooled_x = x[0, :] 
+            pooled_x = x[0, :]
         if return_all:
-            return self.output(x)
+            if logsoftmax:
+                return self.logsoftmax2(self.output(x)[1:])
         y = self.output(pooled_x)
         return y
 
