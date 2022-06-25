@@ -41,7 +41,7 @@ lists = lambda n: [list() for i in range(n)]
 
 class MOGFN(object):
     def __init__(self, bb_task, model, tokenizer, encoder, surrogate, acquisition, num_rounds, num_gens,
-                 pi_lr, z_lr, train_steps, random_action_prob, max_len, batch_size, reward_min, sampling_temp,
+                 pi_lr, z_lr, train_steps, random_action_prob, max_len, min_len, batch_size, reward_min, sampling_temp,
                  wd, therm_n_bins, gen_clip, temp_use_therm, pref_use_therm, encoder_obj, sample_beta,
                  **kwargs):
         self.tokenizer = tokenizer
@@ -51,6 +51,7 @@ class MOGFN(object):
         self._hv_ref = None
         self._ref_point = np.array([1] * bb_task.obj_dim)
         self.max_len = max_len
+        self.min_len = min_len
         self.random_action_prob = random_action_prob
         self.batch_size = batch_size
         self.reward_min = reward_min
@@ -119,13 +120,13 @@ class MOGFN(object):
         self.active_candidates, self.active_targets = pool_candidates, pool_targets
         self.active_seqs = pool_seqs
 
-        pareto_candidates, pareto_targets = pareto_frontier(new_seqs, new_targets)
+        pareto_candidates, pareto_targets = pareto_frontier(new_seqs, new_targets, maximize=True)
         pareto_seqs = np.array([p_cand for p_cand in pareto_candidates])
         pareto_cand_history = pareto_candidates.copy()
         pareto_seq_history = pareto_seqs.copy()
         pareto_target_history = pareto_targets.copy()
         norm_pareto_targets = hypercube_transform(pareto_targets)
-        self._ref_point = -infer_reference_point(-torch.tensor(norm_pareto_targets)).numpy()
+        self._ref_point = infer_reference_point(torch.tensor(norm_pareto_targets)).numpy()
         print(self._ref_point)
         rescaled_ref_point = hypercube_transform.inv_transform(self._ref_point.copy())
 
@@ -135,9 +136,9 @@ class MOGFN(object):
         round_idx = 0
         self._log_candidates(pareto_candidates, pareto_targets, round_idx, log_prefix)
         metrics = self._log_optimizer_metrics(norm_pareto_targets, round_idx, total_bb_evals, start_time, log_prefix)
-
+        self.r_min = new_targets.min(0)
         print('\n best candidates')
-        obj_vals = {f'obj_val_{i}': pareto_targets[:, i].min() for i in range(self.bb_task.obj_dim)}
+        obj_vals = {f'obj_val_{i}': pareto_targets[:, i].max() for i in range(self.bb_task.obj_dim)}
         print(pd.DataFrame([obj_vals]).to_markdown(floatfmt='.4f'))
 
         for round_idx in range(1, self.num_rounds + 1):
@@ -149,7 +150,7 @@ class MOGFN(object):
             # acquisition fns assume maximization so we normalize and negate targets here
             z_score_transform = Normalizer(all_targets.mean(0), all_targets.std(0))
 
-            tgt_transform = lambda x: -z_score_transform(x)
+            tgt_transform = lambda x: z_score_transform(x)
             transformed_ref_point = tgt_transform(rescaled_ref_point)
 
             new_split = DataSplit(new_seqs, new_targets)
@@ -158,11 +159,15 @@ class MOGFN(object):
                 self.train_split, self.val_split, self.test_split, new_split, holdout_ratio,
             )
             self.train_split, self.val_split, self.test_split = all_splits
-
+            self.r_min = np.concatenate((self.r_min.reshape(-1, new_targets.shape[1]), new_targets.min(0).reshape(-1, new_targets.shape[1])), axis=0).min(0)
+            self.r_min_tr = tgt_transform(self.r_min)
+            
             X_train, Y_train = self.train_split.inputs, tgt_transform(self.train_split.targets)
             X_val, Y_val = self.val_split.inputs, tgt_transform(self.val_split.targets)
             X_test, Y_test = self.test_split.inputs, tgt_transform(self.test_split.targets)
+            
             self.tgt_transform = tgt_transform
+            
             records = self.surrogate_model.fit(
                 X_train, Y_train, X_val, Y_val, X_test, Y_test,
                 encoder_obj=self.encoder_obj, resampling_temp=None
@@ -318,10 +323,11 @@ class MOGFN(object):
                                  if not i.endswith(self.eos_char)]).long().to(self.device)
             logits = self.model(x, torch.tile(cond_var, (1, x.shape[1], 1)), mask=None, lens=lens)
             
-            if t == 0:
+            if t < self.min_len:
                 logits[:, 0] = -1000 # Prevent model from stopping
                                      # without having output anything
-                traj_logprob += self.model.Z(cond_var)
+                if t == 0:
+                    traj_logprob += self.model.Z(cond_var)
 
             cat = Categorical(logits=logits / self.sampling_temp)
 
@@ -383,7 +389,7 @@ class MOGFN(object):
         with torch.no_grad():
             ys = self.surrogate_model.predict(pooled_features[1])
         
-        reward = (torch.tensor(prefs) * (ys[1].cpu() + 1)).sum(axis=1)
+        reward = (torch.tensor(prefs) * (ys[1].cpu() - self.r_min_tr)).sum(axis=1)
         return reward
 
     def _log_candidates(self, candidates, targets, round_idx, log_prefix):
