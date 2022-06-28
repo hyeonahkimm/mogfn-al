@@ -17,7 +17,7 @@ beta_cond: True
 pref_cond: True
 beta_scale: 1
 beta_shape: 32
-pref_alpha: 1.5
+pref_alpha: 1
 pi_lr: 0.0001
 z_lr: 0.001
 wd: 0.0001
@@ -26,8 +26,8 @@ therm_n_bins: 50
 gen_clip: 10
 encoder_obj: mlm
 sample_beta: 4
-simplex_bins: 20
-
+simplex_bins: 10
+eval_freq: 500
 model:
   _target_: lambo.models.cond_gfn_transformer.CondGFNTransformer
   max_len: ${task.max_len}

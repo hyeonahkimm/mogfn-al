@@ -377,8 +377,10 @@ class MOGFN(object):
         loss = (logprobs - temp * r.clamp(min=self.reward_min).log()).pow(2).mean()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gen_clip)
+        # 
         self.opt.step()
         self.opt_Z.step()
+        
         return loss.item()
     
     def process_reward(self, seqs, prefs, temp):

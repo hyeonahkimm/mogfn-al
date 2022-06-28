@@ -5,6 +5,7 @@ import time
 import numpy as np
 import torch
 import random
+import matplotlib.pyplot as plt
 
 from torch.nn import functional as F
 from itertools import product
@@ -43,7 +44,7 @@ class MOGFN(object):
     def __init__(self, bb_task, model, tokenizer, encoder, surrogate, acquisition, num_rounds, num_gens,
                  pi_lr, z_lr, train_steps, random_action_prob, max_len, min_len, batch_size, reward_min, sampling_temp,
                  wd, therm_n_bins, gen_clip, beta_use_therm, pref_use_therm, encoder_obj, sample_beta,
-                 beta_cond, pref_cond, beta_scale, beta_shape, pref_alpha, beta_max, simplex_bins, **kwargs):
+                 beta_cond, pref_cond, beta_scale, beta_shape, pref_alpha, beta_max, simplex_bins, eval_freq, **kwargs):
         self.tokenizer = tokenizer
         self.num_rounds = num_rounds
         self.num_gens = num_gens
@@ -67,7 +68,7 @@ class MOGFN(object):
         self.beta_shape = beta_shape
         self.pref_alpha = pref_alpha
         self.beta_max = beta_max
-
+        self.eval_freq = eval_freq
         self.bb_task = hydra.utils.instantiate(bb_task, tokenizer=tokenizer, candidate_pool=[])
 
         self.encoder_config = encoder
@@ -113,25 +114,9 @@ class MOGFN(object):
         )
         new_seqs = all_seqs.copy()
         new_targets = all_targets.copy()
-        
-        # pareto_candidates, pareto_targets = pareto_frontier(new_seqs, new_targets, maximize=True)
-        # pareto_seqs = np.array([p_cand for p_cand in pareto_candidates])
-        # pareto_cand_history = pareto_candidates.copy()
-        # pareto_seq_history = pareto_seqs.copy()
-        # pareto_target_history = pareto_targets.copy()
         self._ref_point = torch.zeros(self.num_props).numpy()
         print(self._ref_point)
         
-        # logging setup
-        # total_bb_evals = 0
-        # start_time = time.time()
-        # round_idx = 0
-        # metrics = self._log_optimizer_metrics(norm_pareto_targets, round_idx, total_bb_evals, start_time, log_prefix)
-
-        # print('\n best candidates')
-        # obj_vals = {f'obj_val_{i}': pareto_targets[:, i].max() for i in range(self.bb_task.obj_dim)}
-        # print(pd.DataFrame([obj_vals]).to_markdown(floatfmt='.4f'))
-
         # metrics = {}
 
         # print(rescaled_ref_point)
@@ -139,9 +124,9 @@ class MOGFN(object):
         print('\n---- optimizing candidates ----')
         gfn_records = self.train()
 
-        return metrics
+        return gfn_records
 
-    def sample_eval(self):
+    def sample_eval(self, plot=False):
         new_candidates = []
         r_scores = [] 
         all_rewards = []
@@ -161,8 +146,20 @@ class MOGFN(object):
         hv_indicator = get_performance_indicator('hv', ref_point=self._ref_point)
         # print(pareto_targets)
         new_hypervol = hv_indicator.do(-pareto_targets)
+        fig = self.plot_pareto(all_rewards) if plot else None
+        
+        return new_candidates, all_rewards, r_scores, new_hypervol, fig
 
-        return new_candidates, r_scores, new_hypervol
+    def plot_pareto(self, obj_vals):
+        if self.num_props <= 3:
+            fig = plt.figure()
+            ax = fig.add_subplot(111) if self.num_props == 2 else fig.add_subplot(111, projection='3d')
+            ax.scatter(*np.hsplit(obj_vals, obj_vals.shape[-1]))
+            ax.set_xlabel("Reward 1")
+            ax.set_ylabel("Reward 2")
+            if self.num_props == 3:
+                ax.set_xlabel("Reward 3")
+            return fig
 
     def get_condition_var(self, prefs=None, beta=None, train=True):
         if prefs is None:
@@ -172,7 +169,7 @@ class MOGFN(object):
                 prefs = np.random.dirichlet([self.pref_alpha]*self.num_props)
         if beta is None:
             if train:
-                beta = np.random.gamma(self.beta_shape, self.beta_scale) if self.beta_cond else self.sample_beta
+                beta = float(np.random.randint(1, self.beta_max+1)) if self.beta_cond else self.sample_beta
             else:
                 beta = self.sample_beta
 
@@ -201,18 +198,30 @@ class MOGFN(object):
             losses.append(loss)
             rewards.append(r)
             
-            if i % 100 == 0:
-                samples, rs, hv = self.sample_eval()
+            if i % self.eval_freq == 0:
+                samples, all_rews, rs, hv, fig = self.sample_eval(plot=True)
                 wandb.log(dict(
-                    hv=hv
-                ))
-
+                    hv=hv,
+                    sample_r=rs.mean()
+                ),commit=False)
+                if fig is not None:
+                    wandb.log(dict(
+                        pareto_front=wandb.Image(fig)
+                    ),commit=False)
+                table = wandb.Table(columns = ["Sequence", "Prefs", "Rewards"])
+                for sample, rew, pref in zip(samples, all_rews, self.simplex):
+                    table.add_data(str(sample), str(rew), str(pref))
+                wandb.log({"generated_seqs": table})
             wandb.log(dict(
                 train_loss=loss,
-                rewards=r
+                train_rewards=r,
             ))
-            pb.set_description("Sample HV: {}, Train Loss: {}, Train Rewards: {}".format(hv, sum(losses[-10:]) / 10, sum(rewards[-10:]) / 10))
-        return losses
+            pb.set_description("Sample Rew: {}, Sample HV: {}, Train Loss: {}, Train Rewards: {}".format(rs.mean(),hv, sum(losses[-10:]) / 10, sum(rewards[-10:]) / 10))
+        return {
+            'losses': losses,
+            'train_rs': rewards,
+            'hypervol_rel': hv
+        }
     
     def train_step(self, batch_size):
         cond_var, (prefs, beta) = self.get_condition_var(train=True)
@@ -247,7 +256,7 @@ class MOGFN(object):
             mask = x.eq(self.encoder.tokenizer.padding_idx)
             mask = torch.cat((torch.zeros((1, mask.shape[1])).to(mask.device), mask), axis=0).bool()
             with torch.no_grad():
-                logits = self.model(x, torch.tile(cond_var, (1, x.shape[1], 1)), mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
+                logits = self.model(x, cond_var, mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
             seq_logits = (logits.reshape(-1, 21)[torch.arange(x.shape[0] * x.shape[1], device=self.device), (x.reshape(-1)-4).clamp(0)].reshape(x.shape) * mask[1:, :].logical_not().float()).sum(0)
             seq_logits += self.model.Z(cond_var)
             r = self.process_reward(self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size], prefs).to(seq_logits.device)
@@ -273,7 +282,7 @@ class MOGFN(object):
             x = x.transpose(1,0)
             lens = torch.tensor([len(i) for i in states
                                  if not i.endswith(self.eos_char)]).long().to(self.device)
-            logits = self.model(x, torch.tile(cond_var, (1, x.shape[1], 1)), mask=None, lens=lens)
+            logits = self.model(x, cond_var, mask=None, lens=lens)
             
             if t < self.min_len:
                 logits[:, 0] = -1000 # Prevent model from stopping

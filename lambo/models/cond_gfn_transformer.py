@@ -13,10 +13,11 @@ class CondGFNTransformer(nn.Module):
         self.embedding = nn.Embedding(vocab_size, num_hid)
         encoder_layers = nn.TransformerEncoderLayer(num_hid, num_head, num_hid, dropout=dropout)
         self.encoder = nn.TransformerEncoder(encoder_layers, num_layers)
-        self.output = nn.Linear(num_hid, num_actions)
+        self.output = nn.Linear(num_hid + num_hid, num_actions)
         self.causal = not bidirectional
-        self.Z_mod = nn.Linear(cond_dim, 64)
+        self.Z_mod = nn.Linear(cond_dim, num_hid)
         self.logsoftmax2 = torch.nn.LogSoftmax(2)
+        self.num_hid = num_hid
 
     def Z(self, cond_var):
         return self.Z_mod(cond_var).sum()
@@ -29,22 +30,18 @@ class CondGFNTransformer(nn.Module):
         return self.Z_mod.parameters()
 
     def forward(self, x, cond, mask, return_all=False, lens=None, logsoftmax=False):
-        cond_var = self.cond_embed(cond)
+        cond_var = self.cond_embed(cond).view(1, self.num_hid)
         x = self.embedding(x)
         x = self.pos(x)
-        if self.causal:
-            x = self.encoder(torch.cat([cond_var, x], axis=0), src_key_padding_mask=mask,
-                             mask=generate_square_subsequent_mask(x.shape[0]+1).to(x.device))
-            pooled_x = x[lens+1, torch.arange(x.shape[1])]
-        else:
-            x = self.encoder(x, src_key_padding_mask=mask)
-            pooled_x = x[0, :]
+        x = self.encoder(x, src_key_padding_mask=mask,
+                            mask=generate_square_subsequent_mask(x.shape[0]).to(x.device))
+        pooled_x = x[lens, torch.arange(x.shape[1])]
         if return_all:
             if logsoftmax:
-                return self.logsoftmax2(self.output(x)[1:])
+                return self.logsoftmax2(self.output(torch.cat((x, torch.tile(cond_var, (x.shape[0], x.shape[1], 1))), axis=-1))[1:])
             else:
-                return self.output(x)[1:]
-        y = self.output(pooled_x)
+                return self.output(torch.cat((x, torch.tile(cond_var, (x.shape[0], x.shape[1], 1))), axis=-1))[1:]
+        y = self.output(torch.cat((pooled_x, torch.tile(cond_var, (pooled_x.shape[0], 1))), axis=-1))
         return y
 
 
