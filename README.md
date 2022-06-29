@@ -170,3 +170,6 @@ If you use any part of this code for your own work, please cite
 ```
 
 
+```bash
+python scripts/black_box_opt.py optimizer=mogfn_direct optimizer.encoder_obj=mlm task=regex_easy tokenizer=protein surrogate=multi_task_exact_gp acquisition=nehvi optimizer.train_steps=10000 task.min_len=12 task.max_len=16 wandb_mode=online optimizer.beta_cond=False optimizer.sample_beta=48 optimizer.beta_max=64
+```

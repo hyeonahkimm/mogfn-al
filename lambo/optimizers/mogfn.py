@@ -32,35 +32,6 @@ def generate_simplex(dims, n_per_dim):
     return np.array([comb for comb in product(*spaces) 
                      if np.allclose(sum(comb), 1.0)])
 
-class MbStack:
-    def __init__(self, encoder, surrogate):
-        self.stack = []
-        # self.f = f
-        self.encoder = encoder
-        self.surrogate = surrogate
-        # feats = (str_to_tokens(base_seqs, self.encoder.tokenizer))
-
-    def push(self, x, i):
-        self.stack.append((x, i))
-
-    def pop_all(self):
-        if not len(self.stack):
-            return []
-        seqs = [i[0] for i in self.stack]
-        # import pdb; pdb.set_trace();
-        toks = str_to_tokens(seqs, self.encoder.tokenizer).to(self.encoder.device)
-        feats, src_mask = self.encoder.get_token_features(toks)
-        pooled_features = self.encoder.pool_features(feats, src_mask)
-
-        with torch.no_grad():
-            ys = self.surrogate.predict(pooled_features[1]) # eos_tok == 2
-
-        # import pdb; pdb.set_trace();
-        idxs = [i[1] for i in self.stack]
-        self.stack = []
-        return zip(1 + ys[1].cpu().numpy(), idxs)
-
-
 def thermometer(v, n_bins=50, vmin=0, vmax=32):
     bins = torch.linspace(vmin, vmax, n_bins)
     gap = bins[1] - bins[0]
@@ -70,7 +41,7 @@ lists = lambda n: [list() for i in range(n)]
 
 class MOGFN(object):
     def __init__(self, bb_task, model, tokenizer, encoder, surrogate, acquisition, num_rounds, num_gens,
-                 pi_lr, z_lr, train_steps, random_action_prob, max_len, batch_size, reward_min, sampling_temp,
+                 pi_lr, z_lr, train_steps, random_action_prob, max_len, min_len, batch_size, reward_min, sampling_temp,
                  wd, therm_n_bins, gen_clip, temp_use_therm, pref_use_therm, encoder_obj, sample_beta,
                  **kwargs):
         self.tokenizer = tokenizer
@@ -80,6 +51,7 @@ class MOGFN(object):
         self._hv_ref = None
         self._ref_point = np.array([1] * bb_task.obj_dim)
         self.max_len = max_len
+        self.min_len = min_len
         self.random_action_prob = random_action_prob
         self.batch_size = batch_size
         self.reward_min = reward_min
@@ -114,7 +86,6 @@ class MOGFN(object):
         # self.model = CondGFNTransformer(self.model_args, pref_dim + temp_dim)
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.num_props = self.bb_task.obj_dim
-        self.workers = MbStack(self.encoder, self.surrogate_model)
         self.model.to(self.device)
         self.opt = torch.optim.Adam(self.model.model_params(), pi_lr, weight_decay=wd,
                             betas=(0.9, 0.999))
@@ -132,6 +103,7 @@ class MOGFN(object):
 
     def optimize(self, candidate_pool, pool_targets, all_seqs, all_targets, log_prefix=''):
         batch_size = self.bb_task.batch_size
+        all_targets = -all_targets
         target_min = all_targets.min(axis=0).copy()
         target_range = all_targets.max(axis=0).copy() - target_min
         hypercube_transform = Normalizer(
@@ -140,7 +112,6 @@ class MOGFN(object):
         )
         new_seqs = all_seqs.copy()
         new_targets = all_targets.copy()
-        import pdb; pdb.set_trace();
         is_feasible = self.bb_task.is_feasible(candidate_pool)
         pool_candidates = candidate_pool[is_feasible]
         pool_targets = pool_targets[is_feasible]
@@ -149,13 +120,13 @@ class MOGFN(object):
         self.active_candidates, self.active_targets = pool_candidates, pool_targets
         self.active_seqs = pool_seqs
 
-        pareto_candidates, pareto_targets = pareto_frontier(new_seqs, new_targets)
+        pareto_candidates, pareto_targets = pareto_frontier(new_seqs, new_targets, maximize=True)
         pareto_seqs = np.array([p_cand for p_cand in pareto_candidates])
         pareto_cand_history = pareto_candidates.copy()
         pareto_seq_history = pareto_seqs.copy()
         pareto_target_history = pareto_targets.copy()
         norm_pareto_targets = hypercube_transform(pareto_targets)
-        self._ref_point = -infer_reference_point(-torch.tensor(norm_pareto_targets)).numpy()
+        self._ref_point = infer_reference_point(torch.tensor(norm_pareto_targets)).numpy()
         print(self._ref_point)
         rescaled_ref_point = hypercube_transform.inv_transform(self._ref_point.copy())
 
@@ -165,71 +136,21 @@ class MOGFN(object):
         round_idx = 0
         self._log_candidates(pareto_candidates, pareto_targets, round_idx, log_prefix)
         metrics = self._log_optimizer_metrics(norm_pareto_targets, round_idx, total_bb_evals, start_time, log_prefix)
-
+        self.r_min = new_targets.min(0)
         print('\n best candidates')
-        obj_vals = {f'obj_val_{i}': pareto_targets[:, i].min() for i in range(self.bb_task.obj_dim)}
+        obj_vals = {f'obj_val_{i}': pareto_targets[:, i].max() for i in range(self.bb_task.obj_dim)}
         print(pd.DataFrame([obj_vals]).to_markdown(floatfmt='.4f'))
 
         for round_idx in range(1, self.num_rounds + 1):
             metrics = {}
 
-            # contract active pool to current Pareto frontier
-            # if (self.concentrate_pool > 0 and round_idx % self.concentrate_pool == 0) or self.latent_init == 'perturb_pareto':
-            #     self.active_candidates, self.active_targets = pareto_frontier(
-            #         self.active_candidates, self.active_targets
-            #     )
-            #     self.active_seqs = np.array([a_cand.mutant_residue_seq for a_cand in self.active_candidates])
-            #     print(f'\nactive set contracted to {self.active_candidates.shape[0]} pareto points')
-            # # augment active set with old pareto points
-            # if self.active_candidates.shape[0] < batch_size:
-            #     num_samples = min(batch_size, pareto_cand_history.shape[0])
-            #     num_backtrack = min(num_samples, batch_size - self.active_candidates.shape[0])
-            #     _, weights, _ = weighted_resampling(pareto_target_history, k=self.resampling_weight)
-            #     hist_idxs = np.random.choice(
-            #         np.arange(pareto_cand_history.shape[0]), num_samples, p=weights, replace=False
-            #     )
-            #     is_active = np.in1d(pareto_seq_history[hist_idxs], self.active_seqs)
-            #     hist_idxs = hist_idxs[~is_active]
-            #     if hist_idxs.size > 0:
-            #         hist_idxs = hist_idxs[:num_backtrack]
-            #         backtrack_candidates = pareto_cand_history[hist_idxs]
-            #         backtrack_targets = pareto_target_history[hist_idxs]
-            #         backtrack_seqs = pareto_seq_history[hist_idxs]
-            #         self.active_candidates = np.concatenate((self.active_candidates, backtrack_candidates))
-            #         self.active_targets = np.concatenate((self.active_targets, backtrack_targets))
-            #         self.active_seqs = np.concatenate((self.active_seqs, backtrack_seqs))
-            #         print(f'active set augmented with {backtrack_candidates.shape[0]} backtrack points')
-            # # augment active set with random points
-            # if self.active_candidates.shape[0] < batch_size:
-            #     num_samples = min(batch_size, pool_candidates.shape[0])
-            #     num_rand = min(num_samples, batch_size - self.active_candidates.shape[0])
-            #     _, weights, _ = weighted_resampling(pool_targets, k=self.resampling_weight)
-            #     rand_idxs = np.random.choice(
-            #         np.arange(pool_candidates.shape[0]), num_samples, p=weights, replace=False
-            #     )
-            #     is_active = np.in1d(pool_seqs[rand_idxs], self.active_seqs)
-            #     rand_idxs = rand_idxs[~is_active][:num_rand]
-            #     rand_candidates = pool_candidates[rand_idxs]
-            #     rand_targets = pool_targets[rand_idxs]
-            #     rand_seqs = pool_seqs[rand_idxs]
-            #     self.active_candidates = np.concatenate((self.active_candidates, rand_candidates))
-            #     self.active_targets = np.concatenate((self.active_targets, rand_targets))
-            #     self.active_seqs = np.concatenate((self.active_seqs, rand_seqs))
-            #     print(f'active set augmented with {rand_candidates.shape[0]} random points')
-
             print(rescaled_ref_point)
-            # print(self.active_targets)
-            # for seq in self.active_seqs:
-            #     if hasattr(self.tokenizer, 'to_smiles'):
-            #         print(self.tokenizer.to_smiles(seq))
-            #     else:
-            #         print(seq)
 
             print('\n---- fitting surrogate model ----')
             # acquisition fns assume maximization so we normalize and negate targets here
             z_score_transform = Normalizer(all_targets.mean(0), all_targets.std(0))
 
-            tgt_transform = lambda x: -z_score_transform(x)
+            tgt_transform = lambda x: z_score_transform(x)
             transformed_ref_point = tgt_transform(rescaled_ref_point)
 
             new_split = DataSplit(new_seqs, new_targets)
@@ -238,11 +159,15 @@ class MOGFN(object):
                 self.train_split, self.val_split, self.test_split, new_split, holdout_ratio,
             )
             self.train_split, self.val_split, self.test_split = all_splits
-
+            self.r_min = np.concatenate((self.r_min.reshape(-1, new_targets.shape[1]), new_targets.min(0).reshape(-1, new_targets.shape[1])), axis=0).min(0)
+            self.r_min_tr = tgt_transform(self.r_min)
+            
             X_train, Y_train = self.train_split.inputs, tgt_transform(self.train_split.targets)
             X_val, Y_val = self.val_split.inputs, tgt_transform(self.val_split.targets)
             X_test, Y_test = self.test_split.inputs, tgt_transform(self.test_split.targets)
-
+            
+            self.tgt_transform = tgt_transform
+            
             records = self.surrogate_model.fit(
                 X_train, Y_train, X_val, Y_val, X_test, Y_test,
                 encoder_obj=self.encoder_obj, resampling_temp=None
@@ -270,20 +195,6 @@ class MOGFN(object):
             }
             wandb.log(metrics)
 
-            # baseline_seqs = np.array([cand.mutant_residue_seq for cand in self.active_candidates])
-            # baseline_targets = self.active_targets
-            # baseline_seqs, baseline_targets = pareto_frontier(baseline_seqs, baseline_targets)
-            # baseline_targets = tgt_transform(baseline_targets)
-
-            # acq_fn = hydra.utils.instantiate(
-            #     self.acquisition,
-            #     X_baseline=baseline_seqs,
-            #     known_targets=torch.tensor(baseline_targets).to(self.surrogate_model.device),
-            #     surrogate=self.surrogate_model,
-            #     ref_point=torch.tensor(transformed_ref_point).to(self.surrogate_model.device),
-            #     obj_dim=self.bb_task.obj_dim,
-            # )
-
             print('\n---- optimizing candidates ----')
             gfn_records = self.train()
             print(gfn_records[-10])
@@ -292,13 +203,11 @@ class MOGFN(object):
             for prefs in self.simplex:
                 prefs_enc = thermometer(torch.from_numpy(prefs), self.therm_n_bins, 0, 1) if self.pref_use_therm else torch.from_numpy(pref)
                 temp_enc = thermometer(torch.from_numpy(np.array([self.sample_beta])), self.therm_n_bins, 0, 1) if self.temp_use_therm else torch.from_numpy(np.array([self.sample_beta]))
-
                 samples, _ = self.sample(self.batch_size // 2, prefs_enc, temp_enc)
                 r = self.process_reward(samples, prefs, self.sample_beta)
                 idx = r.argmax()
                 new_candidates.append(samples[idx])
                 r_scores.append(r.max().item())
-            import pdb; pdb.set_trace();
             r_scores = np.array(r_scores)
             idx = np.random.choice(len(new_candidates), size=self.batch_size)
             new_candidates = np.array(new_candidates)[idx]
@@ -318,55 +227,10 @@ class MOGFN(object):
             print('\n---- querying objective function ----')
             # new_candidates = self.bb_task.make_new_candidates(base_candidates, new_seqs)
 
-            # # filter infeasible candidates
-            # is_feasible = self.bb_task.is_feasible(new_candidates)
-            # base_candidates = base_candidates[is_feasible]
-            # base_seqs = base_seqs[is_feasible]
-            # new_seqs = new_seqs[is_feasible]
-            # new_candidates = new_candidates[is_feasible]
-            # # new_tokens = new_tokens[is_feasible]
-            # if new_candidates.size == 0:
-            #     print('no new candidates')
-            #     continue
-
-            # filter duplicate candidates
-            # new_seqs, unique_idxs = np.unique(new_seqs, return_index=True)
-            # base_candidates = base_candidates[unique_idxs]
-            # base_seqs = base_seqs[unique_idxs]
-            # new_candidates = new_candidates[unique_idxs]
-
-            # # filter redundant candidates
-            # is_new = np.in1d(new_seqs, all_seqs, invert=True)
-            # base_candidates = base_candidates[is_new]
-            # base_seqs = base_seqs[is_new]
-            # new_seqs = new_seqs[is_new]
-            # new_candidates = new_candidates[is_new]
-            # if new_candidates.size == 0:
-            #     print('no new candidates')
-            #     continue
             new_seqs = new_candidates.copy()
             new_targets = self.bb_task.score(new_candidates)
             all_targets = np.concatenate((all_targets, new_targets))
             all_seqs = np.concatenate((all_seqs, new_seqs))
-
-            # for seq in new_seqs:
-            #     if hasattr(self.tokenizer, 'to_smiles'):
-            #         print(self.tokenizer.to_smiles(seq))
-            #     else:
-            #         print(seq)
-
-            # assert base_seqs.shape[0] == new_seqs.shape[0] and new_seqs.shape[0] == new_targets.shape[0]
-            # for b_cand, n_cand, f_val in zip(base_candidates, new_candidates, new_targets):
-            #     print(f'{len(b_cand)} --> {len(n_cand)}: {f_val}')
-
-            # pool_candidates = np.concatenate((pool_candidates, new_candidates))
-            # pool_targets = np.concatenate((pool_targets, new_targets))
-            # pool_seqs = np.concatenate((pool_seqs, new_seqs))
-
-            # augment active pool with candidates that can be mutated again
-            # self.active_candidates = np.concatenate((self.active_candidates, new_candidates))
-            # self.active_targets = np.concatenate((self.active_targets, new_targets))
-            # self.active_seqs = np.concatenate((self.active_seqs, new_seqs))
 
             # overall Pareto frontier including terminal candidates
             pareto_candidates, pareto_targets = pareto_frontier(
@@ -401,18 +265,46 @@ class MOGFN(object):
 
     def train(self):
         losses = []
-        for i in tqdm(range(self.train_steps)):
-            loss = self.train_step(self.batch_size)
+        pref_alpha, temp_shape, temp_scale = 1.5, 2, 1
+        pb = tqdm(range(self.train_steps))
+        for i in pb:
+            loss = self.train_step(self.batch_size, pref_alpha, temp_shape, temp_scale)
             losses.append(loss)
-            if i % 10 == 0:
-                print(sum(losses[-10:]) / 10)
+            if i % 25 == 0:
+                val_loss = self.val_step(self.batch_size, pref_alpha, temp_shape, temp_scale)
+                # print(sum(losses[-10:]) / 10)
+            pb.set_description("Val Loss: {}, Train Loss: {}".format(val_loss, sum(losses[-10:]) / 10))
         return losses
 
-    def get_uniform_simplex(self):
-        pass
+    def val_step(self, batch_size, pref_alpha, temp_shape, temp_scale):
+        # import pdb; pdb.set_trace();
+        prefs = self.simplex[0]# np.random.dirichlet([pref_alpha]*self.num_props)
+        temp = 2
+        if self.pref_use_therm:
+            prefs_enc = thermometer(torch.from_numpy(prefs), self.therm_n_bins, 0, 1)
+        if self.temp_use_therm:
+            temp_enc = thermometer(torch.from_numpy(np.array([temp])), self.therm_n_bins, 0, 32)
+        cond_var = torch.cat((prefs_enc.view(-1), temp_enc.view(-1))).float().to(self.device)
+        num_batches = len(self.val_split.inputs) // self.batch_size
+        losses = 0
+        for i in range(num_batches):
+            x = self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size]
+            # rs = self.tgt_transform(self.val_split.targets[i * self.batch_size:(i+1) * self.batch_size])
+            lens = torch.tensor([len(z) for z in x]).long().to(self.device)
+            # lps = torch.zeros(len(x))
+            x = str_to_tokens(x, self.encoder.tokenizer).to(self.device)
+            x = x.transpose(1, 0)
+            mask = x.eq(self.encoder.tokenizer.padding_idx)
+            mask = torch.cat((torch.zeros((1, mask.shape[1])).to(mask.device), mask), axis=0).bool()
+            with torch.no_grad():
+                logits = self.model(x, torch.tile(cond_var, (1, x.shape[1], 1)), mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
+            seq_logits = (logits.reshape(-1, 21)[torch.arange(x.shape[0] * x.shape[1], device=self.device), (x.reshape(-1)-4).clamp(0)].reshape(x.shape) * mask[1:, :].logical_not().float()).sum(0)
+            seq_logits += self.model.Z(cond_var)
+            r = self.process_reward(self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size], prefs, temp).to(seq_logits.device)
+            loss = (seq_logits - temp * r.clamp(min=self.reward_min).log()).pow(2).mean()
 
-    def val_step(self, val_data):
-        pass
+            losses += loss.item()
+        return losses / num_batches
 
     def sample(self, episodes, prefs, temp):
         states = [''] * episodes
@@ -431,10 +323,11 @@ class MOGFN(object):
                                  if not i.endswith(self.eos_char)]).long().to(self.device)
             logits = self.model(x, torch.tile(cond_var, (1, x.shape[1], 1)), mask=None, lens=lens)
             
-            if t == 0:
+            if t < self.min_len:
                 logits[:, 0] = -1000 # Prevent model from stopping
                                      # without having output anything
-                traj_logprob += self.model.Z(cond_var)
+                if t == 0:
+                    traj_logprob += self.model.Z(cond_var)
 
             cat = Categorical(logits=logits / self.sampling_temp)
 
@@ -450,7 +343,6 @@ class MOGFN(object):
             for b_i, i, c, a in zip(range(len(actions)), active_indices, chars, actions):
                 traj_logprob[i] += log_prob[b_i]
                 if c == self.eos_char or t == self.max_len - 1:
-                    self.workers.push(states[i] + (c if c != self.eos_char else ''), i)
                     r = 0
                     d = 1
                 else:
@@ -463,19 +355,21 @@ class MOGFN(object):
 
         return states, traj_logprob
 
-    def train_step(self, batch_size):
+    def train_step(self, batch_size, pref_alpha, temp_shape, temp_scale):
         # generate cond_var randomly
-        prefs = np.random.dirichlet([1.5]*self.num_props)
-        temp = np.random.gamma(2,1)
+        prefs = np.random.dirichlet([pref_alpha]*self.num_props)
+        temp = np.random.gamma(temp_shape, temp_scale)
         if self.pref_use_therm:
             prefs_enc = thermometer(torch.from_numpy(prefs), self.therm_n_bins, 0, 1)
         if self.temp_use_therm:
             temp_enc = thermometer(torch.from_numpy(np.array([temp])), self.therm_n_bins, 0, 32)
         
         states, logprobs = self.sample(batch_size, prefs_enc, temp_enc)
-        # rs = np.zeros(len(states))
-        # for (r, mbidx) in self.workers.pop_all():
-        #     rs[mbidx] = self.process_reward(r, prefs, temp)
+        # remove [SEP] from the end
+        for i in range(len(states)):
+            if states[i].endswith(self.eos_char):
+                states[i] = states[i][:-5]
+        
         r = self.process_reward(states, prefs, temp).to(self.device)
         self.opt.zero_grad()
         self.opt_Z.zero_grad()        
@@ -483,8 +377,10 @@ class MOGFN(object):
         loss = (logprobs - temp * r.clamp(min=self.reward_min).log()).pow(2).mean()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gen_clip)
+        # 
         self.opt.step()
         self.opt_Z.step()
+        
         return loss.item()
     
     def process_reward(self, seqs, prefs, temp):
@@ -495,7 +391,7 @@ class MOGFN(object):
         with torch.no_grad():
             ys = self.surrogate_model.predict(pooled_features[1])
         
-        reward = (torch.tensor(prefs) * (ys[1].cpu() + 1)).sum(axis=1)
+        reward = (torch.tensor(prefs) * (ys[1].cpu() - self.r_min_tr)).sum(axis=1)
         return reward
 
     def _log_candidates(self, candidates, targets, round_idx, log_prefix):

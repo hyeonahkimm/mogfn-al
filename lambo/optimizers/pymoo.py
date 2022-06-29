@@ -15,7 +15,7 @@ from lambo.models.lm_elements import LanguageModel
 from lambo.utils import weighted_resampling, DataSplit, update_splits, safe_np_cat
 
 
-def pareto_frontier(candidate_pool, obj_vals):
+def pareto_frontier(candidate_pool, obj_vals, maximize=False):
     """
     args:
         candidate_pool: NumPy array of candidate objects
@@ -25,7 +25,10 @@ def pareto_frontier(candidate_pool, obj_vals):
     if len(candidate_pool) == 1:
         return candidate_pool, obj_vals
     # pareto utility assumes maximization
-    pareto_mask = pareto.is_non_dominated(-torch.tensor(obj_vals))
+    if maximize:
+        pareto_mask = pareto.is_non_dominated(torch.tensor(obj_vals))
+    else:
+        pareto_mask = pareto.is_non_dominated(-torch.tensor(obj_vals))
     return candidate_pool[pareto_mask], obj_vals[pareto_mask]
 
 
