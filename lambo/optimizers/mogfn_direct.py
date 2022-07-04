@@ -18,6 +18,8 @@ from lambo.optimizers.pymoo import pareto_frontier, Normalizer
 from lambo.models.shared_elements import check_early_stopping
 from lambo.utils import weighted_resampling, DataSplit, update_splits, str_to_tokens, tokens_to_str, safe_np_cat
 from lambo.models.lanmt import corrupt_tok_idxs
+from lambo.metrics.r2 import r2_indicator_set
+from lambo.metrics.hsr_indicator import HSR_Calculator
 
 import torch
 import torch.nn as nn
@@ -125,30 +127,49 @@ class MOGFN(object):
         gfn_records = self.train()
 
         return gfn_records
+    
+    def compute_mo_metrics(self, solutions):
+        hv_indicator = get_performance_indicator('hv', ref_point=self._ref_point)
+        # print(pareto_targets)
+        hv = hv_indicator.do(-solutions)
+        
+        r2 = r2_indicator_set(self.simplex, solutions, np.ones(self.num_props))
+        hsr_class = HSR_Calculator(lower_bound=-np.ones(self.num_props), upper_bound=np.zeros(self.num_props))
+        hsri, x = hsr_class.calculate_hsr(-solutions)
+        
+        return hv, r2, hsri
 
     def sample_eval(self, plot=False):
         new_candidates = []
         r_scores = [] 
         all_rewards = []
+        topk_rs = []
+        topk_seqs = []
         for prefs in self.simplex:
             cond_var, (_, beta) = self.get_condition_var(prefs=prefs, train=False)
             samples, _ = self.sample(self.batch_size, cond_var, train=False)
             rewards = -self.bb_task.score(samples)
             r = self.process_reward(samples, prefs, rewards=rewards)
-            idx = r.argmax()
-            new_candidates.append(samples[idx])
-            all_rewards.append(rewards[idx])
+            topk_r, topk_idx = torch.topk(r, self.batch_size // 2)
+            samples = np.array(samples)
+            topk_seq = samples[topk_idx]
+            topk_rs.append(topk_r.numpy())
+            topk_seqs.append(topk_seq)
+            max_idx = r.argmax()
+            new_candidates.append(samples[max_idx])
+            all_rewards.append(rewards[max_idx])
             r_scores.append(r.max().item())
+
         r_scores = np.array(r_scores)
         all_rewards = np.array(all_rewards)
         new_candidates = np.array(new_candidates)
         pareto_candidates, pareto_targets = pareto_frontier(new_candidates, all_rewards, maximize=True)
-        hv_indicator = get_performance_indicator('hv', ref_point=self._ref_point)
-        # print(pareto_targets)
-        new_hypervol = hv_indicator.do(-pareto_targets)
+        
+        mo_metrics = self.compute_mo_metrics(pareto_targets)
+
         fig = self.plot_pareto(all_rewards) if plot else None
         
-        return new_candidates, all_rewards, r_scores, new_hypervol, fig
+        return new_candidates, all_rewards, r_scores, mo_metrics, fig
 
     def plot_pareto(self, obj_vals):
         if self.num_props <= 3:
@@ -191,7 +212,7 @@ class MOGFN(object):
     def train(self):
         losses, rewards = [], []
         pref_alpha, beta_shape, beta_scale = 1.5, 16, 1
-        hv = 0
+        hv, r2, hsri = 0, 0, 0
         pb = tqdm(range(self.train_steps))
         for i in pb:
             loss, r = self.train_step(self.batch_size)
@@ -199,16 +220,20 @@ class MOGFN(object):
             rewards.append(r)
             
             if i % self.eval_freq == 0:
-                samples, all_rews, rs, hv, fig = self.sample_eval(plot=True)
+                samples, all_rews, rs, mo_metrics, fig = self.sample_eval(plot=True)
+                hv, r2, hsri = mo_metrics[0], mo_metrics[1], mo_metrics[2][0]
+                # import pdb; pdb.set_trace();
                 wandb.log(dict(
-                    hv=hv,
+                    hv=mo_metrics[0],
+                    r2=mo_metrics[1],
+                    hsri=mo_metrics[2][0],
                     sample_r=rs.mean()
                 ),commit=False)
                 if fig is not None:
                     wandb.log(dict(
                         pareto_front=wandb.Image(fig)
                     ),commit=False)
-                table = wandb.Table(columns = ["Sequence", "Prefs", "Rewards"])
+                table = wandb.Table(columns = ["Sequence", "Rewards", "Prefs"])
                 for sample, rew, pref in zip(samples, all_rews, self.simplex):
                     table.add_data(str(sample), str(rew), str(pref))
                 wandb.log({"generated_seqs": table})
@@ -216,7 +241,7 @@ class MOGFN(object):
                 train_loss=loss,
                 train_rewards=r,
             ))
-            pb.set_description("Sample Rew: {}, Sample HV: {}, Train Loss: {}, Train Rewards: {}".format(rs.mean(),hv, sum(losses[-10:]) / 10, sum(rewards[-10:]) / 10))
+            pb.set_description("Sample Rew: {:.3f}, HV: {:.3f}, R2: {:.3f}, HSRI: {:.3f}, Train Loss: {:.3f}, Train Rewards: {:.3f}".format(rs.mean(), hv, r2, hsri, sum(losses[-10:]) / 10, sum(rewards[-10:]) / 10))
         return {
             'losses': losses,
             'train_rs': rewards,
@@ -313,18 +338,10 @@ class MOGFN(object):
                 states[i] += c
             if all(i.endswith(self.eos_char) for i in states):
                 break
-
         return states, traj_logprob
-
-
     
-    def process_reward(self, seqs, prefs, rewards=None):
-        # toks = str_to_tokens(seqs, self.encoder.tokenizer).to(self.encoder.device)
-        # feats, src_mask = self.encoder.get_token_features(toks)
-        # pooled_features = self.encoder.pool_features(feats, src_mask)
 
-        # with torch.no_grad():
-        #     ys = self.surrogate_model.predict(pooled_features[1])
+    def process_reward(self, seqs, prefs, rewards=None):
         if rewards is None:
             rewards = -self.bb_task.score(seqs)
         reward = (torch.tensor(prefs) * (rewards)).sum(axis=1)
@@ -338,6 +355,7 @@ class MOGFN(object):
             new_row.extend([elem for elem in obj])
             record = {'/'.join((log_prefix, 'candidates', key)): val for key, val in zip(table_cols, new_row)}
             wandb.log(record)
+
 
     def _log_optimizer_metrics(self, normed_targets, round_idx, num_bb_evals, start_time, log_prefix):
         hv_indicator = get_performance_indicator('hv', ref_point=self._ref_point)
