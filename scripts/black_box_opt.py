@@ -22,7 +22,7 @@ def main(config):
     random.seed(None)  # make sure random seed resets between multirun jobs for random job-name generation
     log_config = flatten_config(OmegaConf.to_container(config, resolve=True), sep='/')
     log_config = {'/'.join(('config', key)): val for key, val in log_config.items()}
-    wandb.init(project='mogfn', config=log_config, mode=config.wandb_mode,
+    wandb.init(project='mogfn_v2', config=log_config, mode=config.wandb_mode,
                group=config.group_name, name=config.exp_name, tags=config.exp_tags)
     config['job_name'] = wandb.run.name
     config, _ = startup(config)  # random seed is fixed here

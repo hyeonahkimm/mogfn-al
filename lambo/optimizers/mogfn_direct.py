@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 
 from torch.nn import functional as F
 from itertools import product
+import itertools
+from polyleven import levenshtein
+
 from pymoo.factory import get_performance_indicator
 
 from botorch.utils.multi_objective import infer_reference_point
@@ -29,6 +32,12 @@ from lambo.utils import ResidueTokenizer
 from torch.distributions import Categorical
 import numpy as np
 from tqdm import tqdm
+
+def mean_pairwise_distances(seqs):
+    dists = []
+    for pair in itertools.combinations(seqs, 2):
+        dists.append(levenshtein(*pair))
+    return np.mean(dists)
 
 def generate_simplex(dims, n_per_dim):
     spaces = [np.linspace(0.0, 1.0, n_per_dim) for _ in range(dims)]
@@ -71,6 +80,8 @@ class MOGFN(object):
         self.pref_alpha = pref_alpha
         self.beta_max = beta_max
         self.eval_freq = eval_freq
+        self.k = kwargs["k"]
+        self.num_samples = kwargs["num_samples"]
         self.bb_task = hydra.utils.instantiate(bb_task, tokenizer=tokenizer, candidate_pool=[])
 
         self.encoder_config = encoder
@@ -89,11 +100,6 @@ class MOGFN(object):
         self.acquisition = acquisition
 
         self.tokenizer = tokenizer
-        # self = dotdict(CONFIG["gfn"])
-        # self.model_args = dotdict(CONFIG["model"])
-        # pref_dim = self.therm_n_bins * num_fs if self.pref_use_therm else num_fs
-        # beta_dim = self.therm_n_bins if self.beta_use_therm else 1
-        # self.model = CondGFNTransformer(self.model_args, pref_dim + beta_dim)
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         self.num_props = self.bb_task.obj_dim
         self.model.to(self.device)
@@ -118,10 +124,6 @@ class MOGFN(object):
         new_targets = all_targets.copy()
         self._ref_point = torch.zeros(self.num_props).numpy()
         print(self._ref_point)
-        
-        # metrics = {}
-
-        # print(rescaled_ref_point)
 
         print('\n---- optimizing candidates ----')
         gfn_records = self.train()
@@ -135,8 +137,11 @@ class MOGFN(object):
         
         r2 = r2_indicator_set(self.simplex, solutions, np.ones(self.num_props))
         hsr_class = HSR_Calculator(lower_bound=-np.ones(self.num_props), upper_bound=np.zeros(self.num_props))
-        hsri, x = hsr_class.calculate_hsr(-solutions)
-        
+        try:
+            hsri, x = hsr_class.calculate_hsr(-solutions)
+        except:
+            hsri = 0.
+
         return hv, r2, hsri
 
     def sample_eval(self, plot=False):
@@ -144,17 +149,22 @@ class MOGFN(object):
         r_scores = [] 
         all_rewards = []
         topk_rs = []
-        topk_seqs = []
+        topk_div = []
         for prefs in self.simplex:
             cond_var, (_, beta) = self.get_condition_var(prefs=prefs, train=False)
-            samples, _ = self.sample(self.batch_size, cond_var, train=False)
+            samples, _ = self.sample(self.num_samples, cond_var, train=False)
             rewards = -self.bb_task.score(samples)
             r = self.process_reward(samples, prefs, rewards=rewards)
-            topk_r, topk_idx = torch.topk(r, self.batch_size // 2)
+            
+            # topk metrics
+            topk_r, topk_idx = torch.topk(r, self.k)
             samples = np.array(samples)
-            topk_seq = samples[topk_idx]
-            topk_rs.append(topk_r.numpy())
-            topk_seqs.append(topk_seq)
+            topk_seq = samples[topk_idx].tolist()
+            edit_dist = mean_pairwise_distances(topk_seq)
+            topk_rs.append(topk_r.mean().item())
+            topk_div.append(edit_dist)
+            
+            # top 1 metrics
             max_idx = r.argmax()
             new_candidates.append(samples[max_idx])
             all_rewards.append(rewards[max_idx])
@@ -169,7 +179,7 @@ class MOGFN(object):
 
         fig = self.plot_pareto(all_rewards) if plot else None
         
-        return new_candidates, all_rewards, r_scores, mo_metrics, fig
+        return new_candidates, all_rewards, r_scores, mo_metrics, (np.array(topk_rs), np.array(topk_div)), fig
 
     def plot_pareto(self, obj_vals):
         if self.num_props <= 3:
@@ -212,21 +222,26 @@ class MOGFN(object):
     def train(self):
         losses, rewards = [], []
         pref_alpha, beta_shape, beta_scale = 1.5, 16, 1
-        hv, r2, hsri = 0, 0, 0
+        hv, r2, hsri, rs = 0., 0., 0., np.zeros(self.num_props)
         pb = tqdm(range(self.train_steps))
         for i in pb:
             loss, r = self.train_step(self.batch_size)
             losses.append(loss)
             rewards.append(r)
             
-            if i % self.eval_freq == 0:
-                samples, all_rews, rs, mo_metrics, fig = self.sample_eval(plot=True)
-                hv, r2, hsri = mo_metrics[0], mo_metrics[1], mo_metrics[2][0]
-                # import pdb; pdb.set_trace();
+            if i != 0 and i % self.eval_freq == 0:
+                samples, all_rews, rs, mo_metrics, topk_metrics, fig = self.sample_eval(plot=True)
+                hv, r2, hsri = mo_metrics[0], mo_metrics[1], mo_metrics[2]
+                try:
+                    hsri = hsri if type(hsri) is float else hsri[0]
+                except:
+                    hsri = 0.
                 wandb.log(dict(
+                    topk_rewards=topk_metrics[0].mean(),
+                    topk_diversity=topk_metrics[1].mean(),
                     hv=mo_metrics[0],
                     r2=mo_metrics[1],
-                    hsri=mo_metrics[2][0],
+                    hsri=mo_metrics[2],
                     sample_r=rs.mean()
                 ),commit=False)
                 if fig is not None:
@@ -251,14 +266,11 @@ class MOGFN(object):
     def train_step(self, batch_size):
         cond_var, (prefs, beta) = self.get_condition_var(train=True)
         states, logprobs = self.sample(batch_size, cond_var)
-        # remove [SEP] from the end
-        for i in range(len(states)):
-            if states[i].endswith(self.eos_char):
-                states[i] = states[i][:-5]
         
         r = self.process_reward(states, prefs).to(self.device)
         self.opt.zero_grad()
-        self.opt_Z.zero_grad()        
+        self.opt_Z.zero_grad()
+        
         # TB Loss
         loss = (logprobs - beta * r.clamp(min=self.reward_min).log()).pow(2).mean()
         loss.backward()
@@ -267,23 +279,31 @@ class MOGFN(object):
         self.opt_Z.step()
         return loss.item(), r.mean()
 
+    def get_log_prob(self, states, cond_var):
+        lens = torch.tensor([len(z) + 2 for z in states]).long().to(self.device)
+        x = str_to_tokens(states, self.encoder.tokenizer).to(self.device).t()
+        mask = x.eq(self.encoder.tokenizer.padding_idx)
+        logits = self.model(x, cond_var, mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
+        seq_logits = (logits.reshape(-1, 21)[torch.arange(x.shape[0] * x.shape[1], device=self.device), (x.reshape(-1)-4).clamp(0)].reshape(x.shape) * mask.logical_not().float()).sum(0)
+        seq_logits += self.model.Z(cond_var)
+        return seq_logits
+
     def val_step(self, batch_size):
-        cond_var, _ = self.get_condition_var(train=False)
+        cond_var, (prefs, beta) = self.get_condition_var(train=False)
         num_batches = len(self.val_split.inputs) // self.batch_size
         losses = 0
         for i in range(num_batches):
-            x = self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size]
-            # rs = self.tgt_transform(self.val_split.targets[i * self.batch_size:(i+1) * self.batch_size])
-            lens = torch.tensor([len(z) for z in x]).long().to(self.device)
-            # lps = torch.zeros(len(x))
-            x = str_to_tokens(x, self.encoder.tokenizer).to(self.device)
-            x = x.transpose(1, 0)
-            mask = x.eq(self.encoder.tokenizer.padding_idx)
-            mask = torch.cat((torch.zeros((1, mask.shape[1])).to(mask.device), mask), axis=0).bool()
-            with torch.no_grad():
-                logits = self.model(x, cond_var, mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
-            seq_logits = (logits.reshape(-1, 21)[torch.arange(x.shape[0] * x.shape[1], device=self.device), (x.reshape(-1)-4).clamp(0)].reshape(x.shape) * mask[1:, :].logical_not().float()).sum(0)
-            seq_logits += self.model.Z(cond_var)
+            states = self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size]
+            logprobs = self.get_log_prob(states, cond_var)
+            # lens = torch.tensor([len(z) for z in x]).long().to(self.device)
+            # x = str_to_tokens(x, self.encoder.tokenizer).to(self.device)
+            # x = x.transpose(1, 0)
+            # mask = x.eq(self.encoder.tokenizer.padding_idx)
+            # mask = torch.cat((torch.zeros((1, mask.shape[1])).to(mask.device), mask), axis=0).bool()
+            # with torch.no_grad():
+            #     logits = self.model(x, cond_var, mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
+            # seq_logits = (logits.reshape(-1, 21)[torch.arange(x.shape[0] * x.shape[1], device=self.device), (x.reshape(-1)-4).clamp(0)].reshape(x.shape) * mask[1:, :].logical_not().float()).sum(0)
+            # seq_logits += self.model.Z(cond_var)
             r = self.process_reward(self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size], prefs).to(seq_logits.device)
             loss = (seq_logits - beta * r.clamp(min=self.reward_min).log()).pow(2).mean()
 
@@ -297,19 +317,16 @@ class MOGFN(object):
         traj_logprob = torch.zeros(episodes).to(self.device)
         if cond_var is None:
             cond_var, _ = self.get_condition_var(train=train)
-        # cond_var = torch.cat((prefs.view(-1), beta.view(-1))).float().to(self.device)
-        
+
+        active_mask = torch.ones(episodes).bool().to(self.device)
+        x = str_to_tokens(states, self.encoder.tokenizer).to(self.device).t()[:1]
+        lens = torch.zeros(episodes).long().to(self.device)
+        uniform_pol = torch.empty(episodes).fill_(self.random_action_prob).to(self.device)
+
         for t in (range(self.max_len) if episodes > 0 else []):
-            active_indices = np.int32([i for i in range(episodes)
-                                       if not states[i].endswith(self.eos_char)])
-            # x = torch.tensor([self.tokenizer.encode(states[i], use_sep=False) for i in active_indices]).to(self.device, torch.long)
-            x = str_to_tokens([states[i] for i in active_indices], self.encoder.tokenizer).to(self.encoder.device)
-            x = x.transpose(1,0)
-            lens = torch.tensor([len(i) for i in states
-                                 if not i.endswith(self.eos_char)]).long().to(self.device)
-            logits = self.model(x, cond_var, mask=None, lens=lens)
+            logits = self.model(x, cond_var, lens=lens, mask=None)
             
-            if t < self.min_len:
+            if t <= self.min_len:
                 logits[:, 0] = -1000 # Prevent model from stopping
                                      # without having output anything
                 if t == 0:
@@ -319,25 +336,19 @@ class MOGFN(object):
 
             actions = cat.sample()
             if train and self.random_action_prob > 0:
-                for i in range(actions.shape[0]):
-                    if np.random.uniform(0,1) < self.random_action_prob:
-                        actions[i] = torch.tensor(np.random.randint(t == 0, logits.shape[1])).to(self.device)
-            log_prob = cat.log_prob(actions)
-            chars = [self.tokenizer.convert_id_to_token(i) for i in actions + 4]
+                uniform_mix = torch.bernoulli(uniform_pol).bool()
+                actions = torch.where(uniform_mix, torch.randint(int(t <= self.min_len), logits.shape[1], (episodes, )).to(self.device), actions)
+            
+            log_prob = cat.log_prob(actions) * active_mask
+            traj_logprob += log_prob
 
-            # Append predicted characters for active trajectories
-            for b_i, i, c, a in zip(range(len(actions)), active_indices, chars, actions):
-                traj_logprob[i] += log_prob[b_i]
-                if c == self.eos_char or t == self.max_len - 1:
-                    r = 0
-                    d = 1
-                else:
-                    r = 0
-                    d = 0
-                traj_dones[i].append(d)
-                states[i] += c
-            if all(i.endswith(self.eos_char) for i in states):
+            actions_apply = torch.where(torch.logical_not(active_mask), torch.zeros(episodes).to(self.device).long(), actions + 4)
+            active_mask = torch.where(active_mask, actions != 0, active_mask)
+
+            x = torch.cat((x, actions_apply.unsqueeze(0)), axis=0)
+            if active_mask.sum() == 0:
                 break
+        states = tokens_to_str(x.t(), self.encoder.tokenizer)
         return states, traj_logprob
     
 

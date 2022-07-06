@@ -38,7 +38,7 @@
 
 
 
-for task in regex
+for task in regex_easy regex_easy_3 regex_easy_4 regex
 do
     for simplex_bins in 20
     do
@@ -56,7 +56,7 @@ do
                     done
                 fi
 
-                if test ${sample_beta} -eq 48 
+                if test ${sample_beta} -eq 48
                 then
                     for beta_max in 48 64
                     do

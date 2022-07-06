@@ -4,18 +4,36 @@ import torch.nn.functional as F
 import math
 import numpy as np
 
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, out_dim, hidden_layers, dropout_prob, init_drop=False):
+        super(MLP, self).__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim    
+        layers = [nn.Linear(in_dim, hidden_layers[0]), nn.ReLU()] 
+        layers += [nn.Dropout(dropout_prob)] if init_drop else []
+        for i in range(1, len(hidden_layers)):
+            layers.extend([nn.Linear(hidden_layers[i-1], hidden_layers[i]), nn.ReLU(), nn.Dropout(dropout_prob)])
+        layers.append(nn.Linear(hidden_layers[-1], out_dim))
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x, with_uncertainty=False):
+        return self.model(x)
+
 class CondGFNTransformer(nn.Module):
     def __init__(self, num_hid, cond_dim, max_len, vocab_size, num_actions, dropout, bidirectional, num_layers,
                 num_head, batch_size):
         super().__init__()
-        self.pos = PositionalEncoding(num_hid, dropout=dropout, max_len=max_len + 1)
+        self.pos = PositionalEncoding(num_hid, dropout=dropout, max_len=max_len + 2)
         self.cond_embed = nn.Linear(cond_dim, num_hid)
         self.embedding = nn.Embedding(vocab_size, num_hid)
         encoder_layers = nn.TransformerEncoderLayer(num_hid, num_head, num_hid, dropout=dropout)
         self.encoder = nn.TransformerEncoder(encoder_layers, num_layers)
-        self.output = nn.Linear(num_hid + num_hid, num_actions)
+        # self.output = nn.Linear(num_hid + num_hid, num_actions)
+        self.output = MLP(num_hid + num_hid, num_actions, [4 * num_hid, 4 * num_hid], dropout)
         self.causal = not bidirectional
         self.Z_mod = nn.Linear(cond_dim, num_hid)
+        # self.Z_mod = MLP(cond_dim, num_hid, [num_hid, num_hid], 0.05)
         self.logsoftmax2 = torch.nn.LogSoftmax(2)
         self.num_hid = num_hid
 
@@ -35,12 +53,12 @@ class CondGFNTransformer(nn.Module):
         x = self.pos(x)
         x = self.encoder(x, src_key_padding_mask=mask,
                             mask=generate_square_subsequent_mask(x.shape[0]).to(x.device))
-        pooled_x = x[lens, torch.arange(x.shape[1])]
+        pooled_x = x[lens-1, torch.arange(x.shape[1])]
         if return_all:
             if logsoftmax:
-                return self.logsoftmax2(self.output(torch.cat((x, torch.tile(cond_var, (x.shape[0], x.shape[1], 1))), axis=-1))[1:])
+                return self.logsoftmax2(self.output(torch.cat((x, torch.tile(cond_var, (x.shape[0], x.shape[1], 1))), axis=-1)))
             else:
-                return self.output(torch.cat((x, torch.tile(cond_var, (x.shape[0], x.shape[1], 1))), axis=-1))[1:]
+                return self.output(torch.cat((x, torch.tile(cond_var, (x.shape[0], x.shape[1], 1))), axis=-1))
         y = self.output(torch.cat((pooled_x, torch.tile(cond_var, (pooled_x.shape[0], 1))), axis=-1))
         return y
 
