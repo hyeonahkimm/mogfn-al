@@ -38,7 +38,7 @@ class CondGFNTransformer(nn.Module):
         self.num_hid = num_hid
 
     def Z(self, cond_var):
-        return self.Z_mod(cond_var).sum()
+        return self.Z_mod(cond_var).sum(1)
 
     def model_params(self):
         return list(self.pos.parameters()) + list(self.embedding.parameters()) + list(self.encoder.parameters()) + \
@@ -48,18 +48,23 @@ class CondGFNTransformer(nn.Module):
         return self.Z_mod.parameters()
 
     def forward(self, x, cond, mask, return_all=False, lens=None, logsoftmax=False):
-        cond_var = self.cond_embed(cond).view(1, self.num_hid)
+        """
+        cond is separate cond for each x, same batch dim as x
+        """        
         x = self.embedding(x)
         x = self.pos(x)
         x = self.encoder(x, src_key_padding_mask=mask,
                             mask=generate_square_subsequent_mask(x.shape[0]).to(x.device))
         pooled_x = x[lens-1, torch.arange(x.shape[1])]
+
+        cond_var = self.cond_embed(cond) # batch x hidden_dim
+        cond_var = torch.tile(cond_var, (x.shape[0], 1, 1)) if return_all else cond_var
+        
         if return_all:
-            if logsoftmax:
-                return self.logsoftmax2(self.output(torch.cat((x, torch.tile(cond_var, (x.shape[0], x.shape[1], 1))), axis=-1)))
-            else:
-                return self.output(torch.cat((x, torch.tile(cond_var, (x.shape[0], x.shape[1], 1))), axis=-1))
-        y = self.output(torch.cat((pooled_x, torch.tile(cond_var, (pooled_x.shape[0], 1))), axis=-1))
+            out = self.output(torch.cat((x, cond_var), axis=-1))
+            return self.logsoftmax2(out) if logsoftmax else out
+        
+        y = self.output(torch.cat((pooled_x, cond_var), axis=-1))
         return y
 
 

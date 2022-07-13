@@ -49,8 +49,6 @@ def thermometer(v, n_bins=50, vmin=0, vmax=32):
     gap = bins[1] - bins[0]
     return (v[..., None] - bins.reshape((1,) * v.ndim + (-1,))).clamp(0, gap.item()) / gap
 
-lists = lambda n: [list() for i in range(n)]
-
 class MOGFN(object):
     def __init__(self, bb_task, model, tokenizer, encoder, surrogate, acquisition, num_rounds, num_gens,
                  pi_lr, z_lr, train_steps, random_action_prob, max_len, min_len, batch_size, reward_min, sampling_temp,
@@ -136,7 +134,7 @@ class MOGFN(object):
         hv = hv_indicator.do(-solutions)
         
         r2 = r2_indicator_set(self.simplex, solutions, np.ones(self.num_props))
-        hsr_class = HSR_Calculator(lower_bound=-np.ones(self.num_props), upper_bound=np.zeros(self.num_props))
+        hsr_class = HSR_Calculator(lower_bound=-np.ones(self.num_props) - 0.1, upper_bound=np.zeros(self.num_props) + 0.1)
         try:
             hsri, x = hsr_class.calculate_hsr(-solutions)
         except:
@@ -151,7 +149,7 @@ class MOGFN(object):
         topk_rs = []
         topk_div = []
         for prefs in self.simplex:
-            cond_var, (_, beta) = self.get_condition_var(prefs=prefs, train=False)
+            cond_var, (_, beta) = self.get_condition_var(prefs=prefs, train=False, bs=self.num_samples)
             samples, _ = self.sample(self.num_samples, cond_var, train=False)
             rewards = -self.bb_task.score(samples)
             r = self.process_reward(samples, prefs, rewards=rewards)
@@ -192,7 +190,7 @@ class MOGFN(object):
                 ax.set_xlabel("Reward 3")
             return fig
 
-    def get_condition_var(self, prefs=None, beta=None, train=True):
+    def get_condition_var(self, prefs=None, beta=None, train=True, bs=None):
         if prefs is None:
             if not train:
                 prefs = self.simplex[0]
@@ -217,11 +215,12 @@ class MOGFN(object):
             cond_var = torch.cat((prefs_enc.view(-1), beta_enc.view(-1))).float().to(self.device)
         else:
             cond_var = prefs_enc.view(-1).float().to(self.device)
+        if bs:
+            cond_var = torch.tile(cond_var.unsqueeze(0), (bs, 1))
         return cond_var, (prefs, beta)
 
     def train(self):
         losses, rewards = [], []
-        pref_alpha, beta_shape, beta_scale = 1.5, 16, 1
         hv, r2, hsri, rs = 0., 0., 0., np.zeros(self.num_props)
         pb = tqdm(range(self.train_steps))
         for i in pb:
@@ -230,7 +229,8 @@ class MOGFN(object):
             rewards.append(r)
             
             if i != 0 and i % self.eval_freq == 0:
-                samples, all_rews, rs, mo_metrics, topk_metrics, fig = self.sample_eval(plot=True)
+                with torch.no_grad():
+                    samples, all_rews, rs, mo_metrics, topk_metrics, fig = self.sample_eval(plot=True)
                 hv, r2, hsri = mo_metrics[0], mo_metrics[1], mo_metrics[2]
                 try:
                     hsri = hsri if type(hsri) is float else hsri[0]
@@ -264,9 +264,9 @@ class MOGFN(object):
         }
     
     def train_step(self, batch_size):
-        cond_var, (prefs, beta) = self.get_condition_var(train=True)
+        cond_var, (prefs, beta) = self.get_condition_var(train=True, bs=batch_size)
         states, logprobs = self.sample(batch_size, cond_var)
-        
+
         r = self.process_reward(states, prefs).to(self.device)
         self.opt.zero_grad()
         self.opt_Z.zero_grad()
@@ -279,45 +279,36 @@ class MOGFN(object):
         self.opt_Z.step()
         return loss.item(), r.mean()
 
-    def get_log_prob(self, states, cond_var):
+    def get_log_prob(self, states, cond_var, batch_cond):
         lens = torch.tensor([len(z) + 2 for z in states]).long().to(self.device)
         x = str_to_tokens(states, self.encoder.tokenizer).to(self.device).t()
         mask = x.eq(self.encoder.tokenizer.padding_idx)
-        logits = self.model(x, cond_var, mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
+        logits = self.model(x, cond_var, batch_cond, mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
         seq_logits = (logits.reshape(-1, 21)[torch.arange(x.shape[0] * x.shape[1], device=self.device), (x.reshape(-1)-4).clamp(0)].reshape(x.shape) * mask.logical_not().float()).sum(0)
         seq_logits += self.model.Z(cond_var)
         return seq_logits
 
     def val_step(self, batch_size):
-        cond_var, (prefs, beta) = self.get_condition_var(train=False)
-        num_batches = len(self.val_split.inputs) // self.batch_size
-        losses = 0
-        for i in range(num_batches):
-            states = self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size]
-            logprobs = self.get_log_prob(states, cond_var)
-            # lens = torch.tensor([len(z) for z in x]).long().to(self.device)
-            # x = str_to_tokens(x, self.encoder.tokenizer).to(self.device)
-            # x = x.transpose(1, 0)
-            # mask = x.eq(self.encoder.tokenizer.padding_idx)
-            # mask = torch.cat((torch.zeros((1, mask.shape[1])).to(mask.device), mask), axis=0).bool()
-            # with torch.no_grad():
-            #     logits = self.model(x, cond_var, mask=mask.transpose(1,0), return_all=True, lens=lens, logsoftmax=True)
-            # seq_logits = (logits.reshape(-1, 21)[torch.arange(x.shape[0] * x.shape[1], device=self.device), (x.reshape(-1)-4).clamp(0)].reshape(x.shape) * mask[1:, :].logical_not().float()).sum(0)
-            # seq_logits += self.model.Z(cond_var)
-            r = self.process_reward(self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size], prefs).to(seq_logits.device)
-            loss = (seq_logits - beta * r.clamp(min=self.reward_min).log()).pow(2).mean()
+        overall_loss = 0.
+        for pref in self.simplex:
+            cond_var, (prefs, beta) = self.get_condition_var(prefs=pref, train=False, bs=batch_size)
+            num_batches = len(self.val_split.inputs) // self.batch_size
+            losses = 0
+            for i in range(num_batches):
+                states = self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size]
+                logprobs = self.get_log_prob(states, cond_var, batch_cond=None)
+                r = self.process_reward(self.val_split.inputs[i * self.batch_size:(i+1) * self.batch_size], prefs).to(seq_logits.device)
+                loss = (seq_logits - beta * r.clamp(min=self.reward_min).log()).pow(2).mean()
 
-            losses += loss.item()
-        return losses / num_batches
+                losses += loss.item()
+            overall_loss += (losses / num_batches)
+        return overall_loss / len(self.simplex)
 
     def sample(self, episodes, cond_var=None, train=True):
         states = [''] * episodes
-        traj_dones = lists(episodes)
-
         traj_logprob = torch.zeros(episodes).to(self.device)
         if cond_var is None:
-            cond_var, _ = self.get_condition_var(train=train)
-
+            cond_var, _ = self.get_condition_var(train=train, bs=episodes)
         active_mask = torch.ones(episodes).bool().to(self.device)
         x = str_to_tokens(states, self.encoder.tokenizer).to(self.device).t()[:1]
         lens = torch.zeros(episodes).long().to(self.device)
@@ -333,7 +324,6 @@ class MOGFN(object):
                     traj_logprob += self.model.Z(cond_var)
 
             cat = Categorical(logits=logits / self.sampling_temp)
-
             actions = cat.sample()
             if train and self.random_action_prob > 0:
                 uniform_mix = torch.bernoulli(uniform_pol).bool()

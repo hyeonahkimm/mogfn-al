@@ -360,3 +360,129 @@ class ModelFreeGeneticOptimizer(SequentialGeneticOptimizer):
         new_targets = result.pop.get('F')
         bb_evals = self.num_gens * self.algorithm.pop_size
         return new_candidates, new_targets, new_seqs, bb_evals
+
+
+
+class ModelBasedGeneticOptimizer(SequentialGeneticOptimizer):
+    def __init__(
+            self, bb_task, surrogate, algorithm, acquisition, encoder, tokenizer, num_rounds, num_gens, seed,
+            encoder_obj, **kwargs
+    ):
+        super().__init__(
+            bb_task=bb_task,
+            algorithm=algorithm,
+            tokenizer=tokenizer,
+            num_rounds=num_rounds,
+            num_gens=num_gens,
+            seed=seed,
+            **kwargs
+        )
+        self.encoder = encoder
+        self.surrogate = surrogate
+        self.acquisition = acquisition
+        self.surrogate_model = None
+        self.train_split = DataSplit()
+        self.val_split = DataSplit()
+        self.test_split = DataSplit()
+        self.encoder_obj = encoder_obj
+
+    def _create_inner_task(self, candidate_pool, candidate_weights, input_data, target_data, transform, ref_point,
+                           encoder, round_idx, num_bb_evals, start_time, log_prefix):
+
+        if self.surrogate_model is None:
+            self.surrogate_model = hydra.utils.instantiate(self.surrogate, encoder=encoder, tokenizer=encoder.tokenizer,
+                                                           alphabet=self.tokenizer.non_special_vocab)
+
+        # prepare surrogate dataset
+        tgt_transform = lambda x: -transform(x)
+        transformed_ref_point = tgt_transform(ref_point)
+
+        new_split = DataSplit(input_data, target_data)
+        holdout_ratio = self.surrogate.holdout_ratio
+        all_splits = update_splits(
+            self.train_split, self.val_split, self.test_split, new_split, holdout_ratio,
+        )
+        self.train_split, self.val_split, self.test_split = all_splits
+
+        X_train, Y_train = self.train_split.inputs, tgt_transform(self.train_split.targets)
+        X_val, Y_val = self.val_split.inputs, tgt_transform(self.val_split.targets)
+        X_test, Y_test = self.test_split.inputs, tgt_transform(self.test_split.targets)
+
+        # train surrogate
+        records = self.surrogate_model.fit(
+            X_train, Y_train, X_val, Y_val, X_test, Y_test, resampling_temp=None,
+            encoder_obj=self.encoder_obj
+        )
+        # log result
+        last_entry = {key.split('/')[-1]: val for key, val in records[-1].items()}
+        best_idx = last_entry['best_epoch']
+        best_entry = {key.split('/')[-1]: val for key, val in records[best_idx].items()}
+        print(pd.DataFrame([best_entry]).to_markdown())
+        metrics = dict(
+            test_rmse=best_entry['test_rmse'],
+            test_nll=best_entry['test_nll'],
+            test_s_rho=best_entry['test_s_rho'],
+            test_ece=best_entry['test_ece'],
+            test_post_var=best_entry['test_post_var'],
+            round_idx=round_idx,
+            num_bb_evals=num_bb_evals,
+            num_train=self.train_split.inputs.shape[0],
+            time_elapsed=time.time() - start_time,
+        )
+        metrics = {
+            '/'.join((log_prefix, 'opt_metrics', key)): val for key, val in metrics.items()
+        }
+        wandb.log(metrics)
+
+        # complete task setup
+        baseline_seqs = np.array([cand.mutant_residue_seq for cand in self.active_candidates])
+        baseline_targets = self.active_targets
+        baseline_seqs, baseline_targets = pareto_frontier(baseline_seqs, baseline_targets)
+        baseline_targets = tgt_transform(baseline_targets)
+
+        acq_fn = hydra.utils.instantiate(
+            self.acquisition,
+            X_baseline=baseline_seqs,
+            known_targets=torch.tensor(baseline_targets).to(self.surrogate_model.device),
+            surrogate=self.surrogate_model,
+            ref_point=torch.tensor(transformed_ref_point).to(self.surrogate_model.device),
+            obj_dim=self.bb_task.obj_dim,
+        )
+        inner_task = SurrogateTask(self.tokenizer, candidate_pool, acq_fn, batch_size=acq_fn.batch_size)
+
+        return inner_task
+
+    def _evaluate_result(self, result, candidate_pool, transform, round_idx, num_bb_evals, start_time, log_prefix,
+                         *args, **kwargs):
+        all_x = result.pop.get('X')
+        all_acq_vals = result.pop.get('F')
+
+        cand_batches = result.problem.x_to_query_batches(all_x)
+        query_points = cand_batches[0]
+        query_acq_vals = all_acq_vals[0]
+
+        batch_idx = 1
+        while query_points.shape[0] < self.bb_task.batch_size:
+            query_points = np.concatenate((query_points, cand_batches[batch_idx]))
+            query_acq_vals = np.concatenate((query_acq_vals, all_acq_vals[batch_idx]))
+            batch_idx += 1
+
+        bb_task = hydra.utils.instantiate(
+            self.bb_task, tokenizer=self.tokenizer, candidate_pool=candidate_pool, batch_size=1
+        )
+        bb_out = bb_task.evaluate(query_points, return_as_dictionary=True)
+        new_candidates = bb_out['X_cand'].reshape(-1)
+        new_seqs = bb_out['X_seq'].reshape(-1)
+        new_targets = bb_out["F"]
+        bb_evals = query_points.shape[0]
+
+        metrics = dict(
+            acq_val=query_acq_vals.mean().item(),
+            round_idx=round_idx,
+            num_bb_evals=num_bb_evals,
+            time_elapsed=time.time() - start_time,
+        )
+        metrics = {'/'.join((log_prefix, 'opt_metrics', key)): val for key, val in metrics.items()}
+        wandb.log(metrics)
+
+        return new_candidates, new_targets, new_seqs, bb_evals

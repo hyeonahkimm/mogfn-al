@@ -2,7 +2,7 @@ _target_: lambo.optimizers.mogfn_direct.MOGFN
 _recursive_: False
 num_rounds: 64
 num_gens: 16
-random_action_prob: 0.001
+random_action_prob: 0.01
 max_len: ${task.max_len}
 min_len: ${task.min_len}
 batch_size: 128
@@ -26,7 +26,7 @@ therm_n_bins: 50
 gen_clip: 10
 encoder_obj: mlm
 sample_beta: 4
-simplex_bins: 25
+simplex_bins: 10
 eval_freq: 100
 k: 10
 num_samples: 128
@@ -37,7 +37,7 @@ model:
   vocab_size: 26
   num_actions: 21
   num_hid: 256
-  num_layers: 6
+  num_layers: 3
   num_head: 16
   bidirectional: False
   dropout: 0
