@@ -39,6 +39,16 @@ AMINO_ACIDS = [
 RESIDUE_ALPHABET = ["[PAD]", "[CLS]", "[UNK]", "[MASK]", "[SEP]"] + AMINO_ACIDS + ["0"]
 
 
+def generate_simplex(dims, n_per_dim):
+    spaces = [np.linspace(0.0, 1.0, n_per_dim) for _ in range(dims)]
+    return np.array([comb for comb in itertools.product(*spaces) 
+                     if np.allclose(sum(comb), 1.0)])
+
+def thermometer(v, n_bins=50, vmin=0, vmax=32):
+    bins = torch.linspace(vmin, vmax, n_bins)
+    gap = bins[1] - bins[0]
+    return (v[..., None] - bins.reshape((1,) * v.ndim + (-1,))).clamp(0, gap.item()) / gap
+
 class IntTokenizer:
     def __init__(self, non_special_vocab, full_vocab, padding_token="[PAD]",
                  masking_token="[MASK]", bos_token="[CLS]", eos_token="[SEP]"):
