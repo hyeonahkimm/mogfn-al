@@ -39,7 +39,7 @@ def main(config):
             bb_task = hydra.utils.instantiate(config.task, tokenizer=tokenizer, candidate_pool=[])
 
             project_root = Path(os.getcwd()).parents[2]  # changing the Hydra run dir will break this.
-            base_candidates, base_targets, all_seqs, all_targets = bb_task.task_setup(config, project_root=project_root)
+            base_candidates, base_targets, all_seqs, all_targets = bb_task.task_setup(config, project_root=config.project_dir)
 
             # optimizer
             max_chol_sz = config.surrogate.get('max_cholesky_size', int(1e5))

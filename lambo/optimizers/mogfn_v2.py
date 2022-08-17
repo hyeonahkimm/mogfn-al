@@ -407,7 +407,7 @@ class MOGFN(object):
         r_scores = np.array(r_scores)
         all_rewards = np.array(all_rewards)
         new_candidates = np.array(new_candidates)
-
+        print(r_scores.mean())
         idx = np.argsort(r_scores)[-batch_size:]
         return new_candidates[idx], r_scores[idx]
 
@@ -489,6 +489,7 @@ class MOGFN(object):
     def process_reward(self, seqs, prefs, task, rewards=None):
         if rewards is None:
             rewards = task.score(np.array(seqs))
+        # print(seqs)
         if self.reward_type == "convex":
             log_r = (torch.tensor(prefs) * (rewards)).sum(axis=1).clamp(min=self.reward_min).log()
         elif self.reward_type == "logconvex":
@@ -564,4 +565,4 @@ class Task():
         self.offset = offset
     
     def score(self, x):
-        return - (self.model.posterior(x).mean.cpu().numpy() - self.offset[None, :])
+        return  (-self.model.posterior(x).mean.cpu().numpy()) + self.offset[None, :]

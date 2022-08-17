@@ -313,7 +313,7 @@ class LaMBO(object):
                         lr_sched.step(loss)
 
                     tgt_seqs = tokens_to_str(tgt_tok_idxs, self.encoder.tokenizer)
-                    import pdb; pdb.set_trace();
+                    # import pdb; pdb.set_trace();
                     act_acq_vals = acq_fn(tgt_seqs[None, :]).mean().item()
 
                     best_score, best_step, _, stop = check_early_stopping(
