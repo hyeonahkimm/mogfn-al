@@ -7,4 +7,4 @@ max_num_edits: null
 max_ngram_size: 1
 allow_len_change: False
 num_start_examples: 512
-min_len: 32
+min_len: 244

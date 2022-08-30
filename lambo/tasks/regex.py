@@ -79,7 +79,7 @@ class RegexTask(BaseTask):
         scores = []
         for regex in self.regex_list:
             scores.append(np.array([
-                len(re.findall(regex, str(x))) / self.max_reward_per_dim for x in str_array
+                len(re.findall(regex, str(x))) for x in str_array
             ]).reshape(-1))
         scores = -np.stack(scores, axis=-1).astype(np.float64)
         return scores

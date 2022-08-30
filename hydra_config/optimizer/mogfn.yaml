@@ -4,10 +4,10 @@ num_rounds: 64
 random_action_prob: 0.01
 max_len: ${task.max_len}
 min_len: ${task.min_len}
-train_batch_size: 64
+train_batch_size: 16
 reward_min: 1e-80
 sampling_temp: 1
-num_opt_steps: 1000
+num_opt_steps: 500
 beta_use_therm: False
 pref_use_therm: True
 beta_cond: False
@@ -32,14 +32,19 @@ use_eval_pref: False
 resampling_weight: 1.
 concentrate_pool: 1
 val_batch_size: 16
+share_encoder: False
+freeze_encoder: False
+use_acqf: False
+offline_gamma: 0
+
 
 model:
-  _target_: torch_seq_moo.algorithms.mogfn_utils.conditional_transformer.CondGFNTransformer
+  _target_: lambo.models.cond_gfn_transformer.CondGFNTransformer
   max_len: ${task.max_len}
   vocab_size: 26
   num_actions: 21
-  num_hid: 256
+  num_hid: 128
   num_layers: 3
-  num_head: 16
+  num_head: 8
   bidirectional: False
   dropout: 0

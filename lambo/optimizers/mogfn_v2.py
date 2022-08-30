@@ -74,18 +74,25 @@ class MOGFN(object):
         self.beta_max = kwargs["beta_max"]
         self.reward_type = kwargs["reward_type"]
         self.eval_freq = kwargs["eval_freq"]
+        self.offline_gamma = kwargs["offline_gamma"]
         self.k = kwargs["k"]
         self.num_samples = kwargs["num_eval_samples"]
         self.eos_char = "[SEP]"
         self.pad_tok = self.tokenizer.convert_token_to_id("[PAD]")
         self.simplex = generate_simplex(self.obj_dim, kwargs["simplex_bins"])
-        self.max_len = kwargs["max_len"]
+        self.max_len = kwargs["max_len"] - 2 # -2 because the lambo tasks count BOS and EOS tokens as well
         self.min_len = kwargs["min_len"] if kwargs["min_len"] else 2
         pref_dim = self.therm_n_bins * self.obj_dim if self.pref_use_therm else self.obj_dim
         beta_dim = self.therm_n_bins if self.beta_use_therm else 1
         cond_dim = pref_dim + beta_dim if self.beta_cond else pref_dim
+        share_encoder = kwargs.get("share_encoder", False)
+        freeze_encoder = kwargs.get("freeze_encoder", False)
+        self.use_acqf = kwargs.get("use_acqf", False)
+        self.acq_kappa = kwargs.get("acq_kappa", 0.1)
+        
         self.model_cfg = model
-        self.model = hydra.utils.instantiate(model, cond_dim=cond_dim, use_cond=(self.beta_cond or self.pref_cond))
+        self.model = hydra.utils.instantiate(model, cond_dim=cond_dim, use_cond=(self.beta_cond or self.pref_cond),
+                                             encoder=self.encoder if share_encoder else None)
 
         self.model.to(self.device)
         self.opt = torch.optim.Adam(self.model.model_params(), kwargs["pi_lr"], weight_decay=kwargs["wd"],
@@ -239,7 +246,7 @@ class MOGFN(object):
             baseline_seqs, baseline_targets = pareto_frontier(baseline_seqs, baseline_targets)
             baseline_targets = tgt_transform(baseline_targets)
 
-            self.acq_fn = hydra.utils.instantiate(
+            acq_fn = hydra.utils.instantiate(
                 self.acquisition,
                 X_baseline=baseline_seqs,
                 known_targets=torch.tensor(baseline_targets).to(self.surrogate_model.device),
@@ -248,17 +255,20 @@ class MOGFN(object):
                 obj_dim=self.bb_task.obj_dim,
             )
 
-            task = Task(self.surrogate_model, offset=Y_train.max(0))
-
+            if self.use_acqf:
+                task = AcqFnTask(acq_fn)
+            else:
+                task = Task(self.surrogate_model, max_val=Y_train.max(0), kappa=self.acq_kappa)
+            
             print('\n---- optimizing candidates ----')
             train_losses, train_rewards, val_losses = [], [], []
             hv, rs, val_loss = 0., np.zeros(self.obj_dim), 0.
             pb = tqdm(range(self.num_opt_steps))
             desc_str = "Evaluation := Reward: {:.3f} HV: {:.3f} | Validation:= Loss {:.3f} | Train := Loss: {:.3f} Rewards: {:.3f}"
             pb.set_description(desc_str.format(0,0,0,0,0))
+            # import pdb; pdb.set_trace();
             
             for i in pb:
-                # import pdb; pdb.set_trace();
                 loss, r = self.train_step(task, self.train_batch_size)
                 train_losses.append(loss)
                 train_rewards.append(r)
@@ -272,18 +282,10 @@ class MOGFN(object):
                     # add early stopping logic? 
 
                 pb.set_description(desc_str.format(rs.mean(),hv,val_loss,sum(train_losses[-10:]) / 10 , sum(train_rewards[-10:]) / 10))
-
-            new_seqs, r_scores = self.sample_new_pareto_front(task, batch_size)
-
-            # generate new sequences
-            # new_seq_batches = np.stack(new_seq_batches)
-            # new_seq_scores = np.stack(new_seq_scores)
-            # best_batch_idx = new_seq_scores.argmin()
-
-            # base_candidates = base_cand_batches[best_batch_idx]
-            # base_seqs = np.array([b_cand.mutant_residue_seq for b_cand in base_candidates])
-            # new_seqs = new_seq_batches[best_batch_idx]
             
+            # import pdb; pdb.set_trace();
+            with torch.no_grad():
+                new_seqs, r_scores = self.sample_new_pareto_front(task, self.val_batch_size)
 
             # logging
             metrics = dict(
@@ -297,7 +299,7 @@ class MOGFN(object):
             wandb.log(metrics)
 
             print('\n---- querying objective function ----')
-            new_candidates = np.array([StringCandidate(seq, [], self.tokenizer) for seq in new_seqs])
+            new_candidates = np.array([type(self.active_candidates[0])(seq, [], self.tokenizer) for seq in new_seqs])
             # self.bb_task.make_new_candidates(new_seqs, new_seqs)
 
             # filter infeasible candidates
@@ -336,7 +338,7 @@ class MOGFN(object):
                     print(self.tokenizer.to_smiles(seq))
                 else:
                     print(seq)
-
+            # import pdb; pdb.set_trace();
             # assert base_seqs.shape[0] == new_seqs.shape[0] and new_seqs.shape[0] == new_targets.shape[0]
             # for b_cand, n_cand, f_val in zip(base_candidates, new_candidates, new_targets):
             #     print(f'{len(b_cand)} --> {len(n_cand)}: {f_val}')
@@ -381,15 +383,29 @@ class MOGFN(object):
         return metrics
     
     def sample_new_pareto_front(self, task, batch_size):
+        num_batches = self.num_samples // batch_size + 1
         new_candidates = []
         r_scores = [] 
         all_rewards = []
         for prefs in self.simplex:
-            cond_var, (_, beta) = self._get_condition_var(prefs=prefs, train=False, bs=self.num_samples)
-            samples, _ = self.sample(self.num_samples, cond_var, train=False)
-            rewards = task.score(samples)
-            r = self.process_reward(samples, prefs, task, rewards=rewards)
-            
+            samples_list = []
+            rewards = []
+            rs = []
+            for i in range(num_batches):
+                if i * batch_size > self.num_samples:
+                    break
+                
+                cond_var, (_, beta) = self._get_condition_var(prefs=prefs, train=False, bs=batch_size)
+                batch_samples, _ = self.sample(batch_size, cond_var, train=False)
+                batch_rewards = task.score(batch_samples)
+                batch_r = self.process_reward(batch_samples, prefs, task, rewards=batch_rewards)
+                rs.append(batch_r)
+                rewards.append(batch_rewards)
+                samples_list.append(batch_samples)
+            r = torch.cat(rs)
+            rewards = np.concatenate(rewards)
+            samples = np.concatenate(samples_list)
+            # import pdb; pdb.set_trace();
             # topk metrics
             # topk_r, topk_idx = torch.topk(r, self.k)
             # samples = np.array(samples)
@@ -411,12 +427,22 @@ class MOGFN(object):
         idx = np.argsort(r_scores)[-batch_size:]
         return new_candidates[idx], r_scores[idx]
 
+    def sample_offline_data(self, size, prefs):
+        # import pdb; pdb.set_trace();
+        w = -np.sum(prefs[None, :] * self.train_split.targets, axis=-1)
+        return np.random.choice(self.train_split.inputs, size=size, replace=False, p = np.exp(w - w.max()) / np.exp(w-w.max()).sum(0))
 
     def train_step(self, task, batch_size):
         cond_var, (prefs, beta) = self._get_condition_var(train=True, bs=batch_size)
         states, logprobs = self.sample(batch_size, cond_var)
-
+        if self.offline_gamma > 0 and int(self.offline_gamma * batch_size) > 0:
+            offline_batch = self.sample_offline_data(int(self.offline_gamma * batch_size), prefs=prefs)
+            cond_var, _ = self._get_condition_var(prefs=prefs, beta=beta, train=True, bs=int(self.offline_gamma * batch_size))
+            offline_logprobs = self._get_log_prob(offline_batch, cond_var)
+            logprobs = torch.cat((logprobs, offline_logprobs), axis=0)
+            states = np.concatenate((states, offline_batch), axis=0)
         log_r = self.process_reward(states, prefs, task).to(self.device)
+
         self.opt.zero_grad()
         self.opt_Z.zero_grad()
         
@@ -439,7 +465,7 @@ class MOGFN(object):
             losses = 0
             for pref in self.simplex:
                 cond_var, (prefs, beta) = self._get_condition_var(prefs=pref, train=False, bs=len(states))
-                logprobs = self._get_log_prob(states, cond_var, batch_cond=None)
+                logprobs = self._get_log_prob(states, cond_var)
                 log_r = self.process_reward(None, prefs, task, rewards=rews).to(logprobs.device)
                 loss = (logprobs - beta * log_r).pow(2).mean()
 
@@ -488,7 +514,7 @@ class MOGFN(object):
 
     def process_reward(self, seqs, prefs, task, rewards=None):
         if rewards is None:
-            rewards = task.score(np.array(seqs))
+            rewards = task.score(np.array(seqs)).clip(min=self.reward_min)
         # print(seqs)
         if self.reward_type == "convex":
             log_r = (torch.tensor(prefs) * (rewards)).sum(axis=1).clamp(min=self.reward_min).log()
@@ -550,7 +576,7 @@ class MOGFN(object):
             cond_var = torch.tile(cond_var.unsqueeze(0), (bs, 1))
         return cond_var, (prefs, beta)
 
-    def _get_log_prob(self, states, cond_var, batch_cond):
+    def _get_log_prob(self, states, cond_var):
         lens = torch.tensor([len(z) + 2 for z in states]).long().to(self.device)
         x = str_to_tokens(states, self.tokenizer).to(self.device).t()
         mask = x.eq(self.tokenizer.padding_idx)
@@ -560,9 +586,19 @@ class MOGFN(object):
         return seq_logits
 
 class Task():
-    def __init__(self, model, offset):
+    def __init__(self, model, max_val, kappa):
         self.model = model
-        self.offset = offset
+        self.offset = max_val 
+        self.kappa=kappa
     
     def score(self, x):
-        return  (-self.model.posterior(x).mean.cpu().numpy()) + self.offset[None, :]
+        posterior = self.model.posterior(x)
+        return (-posterior.mean.cpu().numpy() + self.kappa * posterior.variance.cpu().sqrt().numpy() + self.offset[None, :])
+
+
+class AcqFnTask():
+    def __init__(self, acq_fn):
+        self.acq_fn = acq_fn
+    
+    def score(self, x):
+        return self.acq_fn(x[:, None])
