@@ -271,18 +271,16 @@ class MOGFNSeq(object):
             # import pdb; pdb.set_trace();
             
             for i in pb:
-                if i==11:
-                    import pdb; pdb.set_trace();
-                    
+                # import pdb;pdb.set_trace();
                 loss, r = self.train_step(task, self.train_batch_size)
                 train_losses.append(loss)
                 train_rewards.append(r)
                 
                 # if i != 0 and i % self.eval_freq == 0:
-                if i % self.eval_freq == 0:
-                    with torch.no_grad():
-                        # samples, all_rews, rs, mo_metrics, topk_metrics = self.evaluation(task, plot=True)
-                        val_loss = self.val_step(task, self.val_batch_size)
+                # if i % self.eval_freq == 0:
+                #     with torch.no_grad():
+                #         # samples, all_rews, rs, mo_metrics, topk_metrics = self.evaluation(task, plot=True)
+                #         val_loss = self.val_step(task, self.val_batch_size)
 
                     # add early stopping logic? 
 
@@ -433,7 +431,8 @@ class MOGFNSeq(object):
 
     def train_step(self, task, batch_size):
         cond_var, (prefs, beta) = self._get_condition_var(train=True, bs=batch_size)
-        states, logprobs = self.sample(batch_size, cond_var)
+        start_states = np.random.choice(self.active_seqs, size=batch_size, replace=True)
+        states, logprobs = self.sample(start_states, cond_var, batch_size)
         if self.offline_gamma > 0 and int(self.offline_gamma * batch_size) > 0:
             offline_batch = self.sample_offline_data(int(self.offline_gamma * batch_size), prefs=prefs)
             cond_var, _ = self._get_condition_var(prefs=prefs, beta=beta, train=True, bs=int(self.offline_gamma * batch_size))
@@ -472,38 +471,67 @@ class MOGFNSeq(object):
             overall_loss += (losses / num_batches)
         return overall_loss / len(self.simplex)
 
-    def sample(self, episodes, cond_var=None, train=True):
-        states = [''] * episodes
+    def sample(self, start_states, cond_var=None, episodes=16, train=True):
+        states = start_states
         traj_logprob = torch.zeros(episodes).to(self.device)
         if cond_var is None:
             cond_var, _ = self._get_condition_var(train=train, bs=episodes)
         active_mask = torch.ones(episodes).bool().to(self.device)
-        x = str_to_tokens(states, self.tokenizer).to(self.device).t()[:1]
-        lens = torch.zeros(episodes).long().to(self.device)
+        x = str_to_tokens(states, self.tokenizer).to(self.device).t()
+        lens = torch.tensor(np.array([len(s) for s in states])).long().to(self.device)
         uniform_pol = torch.empty(episodes).fill_(self.random_action_prob).to(self.device)
-
-        for t in (range(self.max_len) if episodes > 0 else []):
-            logits = self.model(x, cond_var, lens=lens, mask=None)
-            
+        updated = torch.empty(episodes).long().to(self.device)
+        for t in (range(self.max_len-2) if episodes > 0 else []):
+            # import pdb; pdb.set_trace();
+            pos_logits, tok_logits = self.model(x, cond_var, lens=lens, mask=None)
+            # tokens in the sequence cannot 
+            tok_logits[:, :, :5] = -1000 # block all special tokens
+            tok_logits[:, 0, 5:] = -1000 # can't change cls to anything
+            pos_logits[:, lens+1] = -1000 # can't change last token
+            pos_logits[x.t() == 0] = -1000
+            if t > 0:
+                if t == 1:
+                    pos_logits = pos_logits.scatter(1, updated.unsqueeze(1),-1000)    
+                else:
+                    pos_logits = pos_logits.scatter(1, updated,-1000)
+                
             if t <= self.min_len:
-                logits[:, 0] = -1000 # Prevent model from stopping
+                # pos 0 (cls token) indicates stop
+                pos_logits[:, 0] = -1000 # Prevent model from stopping
                                      # without having output anything
                 if t == 0:
                     traj_logprob += self.model.Z(cond_var)
 
-            cat = Categorical(logits=logits / self.sampling_temp)
-            actions = cat.sample()
+            pos_dist = Categorical(logits=pos_logits / self.sampling_temp)
+            pos_actions = pos_dist.sample()
+
             if train and self.random_action_prob > 0:
                 uniform_mix = torch.bernoulli(uniform_pol).bool()
-                actions = torch.where(uniform_mix, torch.randint(int(t <= self.min_len), logits.shape[1], (episodes, )).to(self.device), actions)
+                pos_actions = torch.where(uniform_mix, torch.randint(int(t <= self.min_len), pos_logits.shape[1]-1, (episodes, )).to(self.device), pos_actions)
             
-            log_prob = cat.log_prob(actions) * active_mask
+            tok_logits = tok_logits[torch.arange(tok_logits.shape[0]), pos_actions, :]
+            tok_logits[torch.arange(tok_logits.shape[0]), x.t()[torch.arange(x.shape[1]), pos_actions]] = -1000
+            tok_dist = Categorical(logits=tok_logits / self.sampling_temp)
+            tok_actions = tok_dist.sample()
+
+            log_prob = (pos_dist.log_prob(pos_actions) + tok_dist.log_prob(tok_actions)) * active_mask
             traj_logprob += log_prob
 
-            actions_apply = torch.where(torch.logical_not(active_mask), torch.zeros(episodes).to(self.device).long(), actions + 4)
-            active_mask = torch.where(active_mask, actions != 0, active_mask)
+
+            active_mask = torch.where(active_mask, pos_actions != 0, active_mask)
             # Apply action function
-            x = torch.cat((x, actions_apply.unsqueeze(0)), axis=0)
+            # if active_mask.sum() < 128:
+            #     import pdb;pdb.set_trace();
+            tok_actions = torch.where(active_mask, tok_actions, x.t()[torch.arange(x.shape[1]), pos_actions])
+            x = x.scatter(0, pos_actions.unsqueeze(1), tok_actions)
+            # x = torch.where()
+            # x[pos_actions, active_mask] = tok_actions[active_mask]
+            if t > 0:
+                updated = torch.column_stack((updated, pos_actions))
+            else:
+                updated = pos_actions
+            # actions_apply = torch.where(torch.logical_not(active_mask), torch.zeros(episodes).to(self.device).long(), actions + 4)
+            # x = torch.cat((x, actions_apply.unsqueeze(0)), axis=0)
             # x = self.apply_action(x, actions_apply)
 
             if active_mask.sum() == 0:

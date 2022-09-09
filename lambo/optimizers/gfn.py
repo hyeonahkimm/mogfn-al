@@ -20,7 +20,13 @@ from lambo.utils import weighted_resampling, DataSplit, update_splits, str_to_to
 from lambo.models.lanmt import corrupt_tok_idxs
 from lambo.candidate import StringCandidate, FoldedCandidate
 
-class MOGFN(object):
+
+def weight_reset(m):
+    reset_parameters = getattr(m, "reset_parameters", None)
+    if callable(reset_parameters):
+        m.reset_parameters()
+
+class GFN(object):
     def __init__(self, bb_task, tokenizer, encoder, surrogate, acquisition, num_rounds, 
                  num_opt_steps, concentrate_pool, resampling_weight, encoder_obj, model, **kwargs):
 
@@ -62,15 +68,12 @@ class MOGFN(object):
         self.reward_min = kwargs["reward_min"]
         self.therm_n_bins = kwargs["therm_n_bins"]
         self.beta_use_therm = kwargs["beta_use_therm"]
-        self.pref_use_therm = kwargs["pref_use_therm"]
         self.gen_clip = kwargs["gen_clip"]
         self.sampling_temp = kwargs["sampling_temp"]
         self.sample_beta = kwargs["sample_beta"]
         self.beta_cond = kwargs["beta_cond"]
-        self.pref_cond = kwargs["pref_cond"]
         self.beta_scale = kwargs["beta_scale"]
         self.beta_shape = kwargs["beta_shape"]
-        self.pref_alpha = kwargs["pref_alpha"]
         self.beta_max = kwargs["beta_max"]
         self.reward_type = kwargs["reward_type"]
         self.eval_freq = kwargs["eval_freq"]
@@ -82,16 +85,16 @@ class MOGFN(object):
         self.simplex = generate_simplex(self.obj_dim, kwargs["simplex_bins"])
         self.max_len = kwargs["max_len"] - 2 # -2 because the lambo tasks count BOS and EOS tokens as well
         self.min_len = kwargs["min_len"] if kwargs["min_len"] else 2
-        pref_dim = self.therm_n_bins * self.obj_dim if self.pref_use_therm else self.obj_dim
+        # pref_dim = self.therm_n_bins * self.obj_dim if self.pref_use_therm else self.obj_dim
         beta_dim = self.therm_n_bins if self.beta_use_therm else 1
-        cond_dim = pref_dim + beta_dim if self.beta_cond else pref_dim
+        cond_dim = beta_dim
         share_encoder = kwargs.get("share_encoder", False)
         freeze_encoder = kwargs.get("freeze_encoder", False)
         self.use_acqf = kwargs.get("use_acqf", False)
         self.acq_kappa = kwargs.get("acq_kappa", 0.1)
         
         self.model_cfg = model
-        self.model = hydra.utils.instantiate(model, cond_dim=cond_dim, use_cond=(self.beta_cond or self.pref_cond),
+        self.model = hydra.utils.instantiate(model, cond_dim=cond_dim, use_cond=(self.beta_cond),
                                              encoder=self.encoder if share_encoder else None, encoder_config=self.encoder_config if share_encoder else None)
 
         self.model.to(self.device)
@@ -143,7 +146,7 @@ class MOGFN(object):
 
         for round_idx in range(1, self.num_rounds + 1):
             metrics = {}
-
+            # import pdb; pdb.set_trace();
             # contract active pool to current Pareto frontier
             if (self.concentrate_pool > 0 and round_idx % self.concentrate_pool == 0) or self.latent_init == 'perturb_pareto':
                 self.active_candidates, self.active_targets = pareto_frontier(
@@ -361,7 +364,7 @@ class MOGFN(object):
                 np.concatenate((pareto_targets, new_targets)),
             )
             pareto_seqs = np.array([p_cand.mutant_residue_seq for p_cand in pareto_candidates])
-
+            self.model.apply(weight_reset)
             print('\n new candidates')
             obj_vals = {f'obj_val_{i}': new_targets[:, i].min() for i in range(self.bb_task.obj_dim)}
             print(pd.DataFrame([obj_vals]).to_markdown(floatfmt='.4f'))
@@ -390,24 +393,24 @@ class MOGFN(object):
         new_candidates = []
         r_scores = [] 
         all_rewards = []
-        for prefs in self.simplex:
-            samples_list = []
-            rewards = []
-            rs = []
-            for i in range(num_batches):
-                if i * batch_size > self.num_samples:
-                    break
-                
-                cond_var, (_, beta) = self._get_condition_var(prefs=prefs, train=False, bs=batch_size)
-                batch_samples, _ = self.sample(batch_size, cond_var, train=False)
-                batch_rewards = task.score(batch_samples)
-                batch_r = self.process_reward(batch_samples, prefs, task, rewards=batch_rewards)
-                rs.append(batch_r)
-                rewards.append(batch_rewards)
-                samples_list.append(batch_samples)
-            r = torch.cat(rs)
-            rewards = np.concatenate(rewards)
-            samples = np.concatenate(samples_list)
+        # for prefs in self.simplex:
+        samples_list = []
+        rewards = []
+        rs = []
+        for i in range(num_batches):
+            if i * batch_size > self.num_samples:
+                break
+            
+            cond_var, (_, beta) = self._get_condition_var(prefs=None, train=False, bs=batch_size)
+            batch_samples, _ = self.sample(batch_size, cond_var, train=False)
+            batch_rewards = task.score(batch_samples)
+            batch_r = self.process_reward(batch_samples, None, task, rewards=batch_rewards)
+            rs.append(batch_r)
+            rewards.append(batch_rewards.cpu().numpy())
+            samples_list.append(batch_samples)
+        r = torch.cat(rs).cpu().numpy()
+        rewards = np.concatenate(rewards)
+        samples = np.concatenate(samples_list)
             # import pdb; pdb.set_trace();
             # topk metrics
             # topk_r, topk_idx = torch.topk(r, self.k)
@@ -418,17 +421,17 @@ class MOGFN(object):
             # topk_div.append(edit_dist)
             
             # top 1 metrics
-            max_idx = r.argmax()
-            new_candidates.append(samples[max_idx])
-            all_rewards.append(rewards[max_idx])
-            r_scores.append(r.max().item())
+        # max_idx = r.argmax()
+        # new_candidates.append(samples[max_idx])
+        # all_rewards.append(rewards[max_idx])
+        # r_scores.append(r.max().item())
 
-        r_scores = np.array(r_scores)
-        all_rewards = np.array(all_rewards)
-        new_candidates = np.array(new_candidates)
-        print(r_scores.mean())
-        idx = np.argsort(r_scores)[-batch_size:]
-        return new_candidates[idx], r_scores[idx]
+        # r_scores = np.array(r_scores)
+        # all_rewards = np.array(all_rewards)
+        # new_candidates = np.array(new_candidates)
+        print(r.mean())
+        idx = np.argsort(r)[-batch_size:]
+        return samples[idx], r[idx]
 
     def sample_offline_data(self, size, prefs):
         # import pdb; pdb.set_trace();
@@ -518,12 +521,13 @@ class MOGFN(object):
 
     def process_reward(self, seqs, prefs, task, rewards=None):
         if rewards is None:
-            rewards = task.score(np.array(seqs)).clip(min=self.reward_min)
+            rewards = task.score(np.array(seqs))
+        log_r = rewards.clamp(min=self.reward_min).log()
         # print(seqs)
-        if self.reward_type == "convex":
-            log_r = (torch.tensor(prefs) * (rewards)).sum(axis=1).clamp(min=self.reward_min).log()
-        elif self.reward_type == "logconvex":
-            log_r = (torch.tensor(prefs) * torch.tensor(rewards).clamp(min=self.reward_min).log()).sum(axis=1)
+        # if self.reward_type == "convex":
+        #     log_r = (torch.tensor(prefs) * (rewards)).sum(axis=1).clamp(min=self.reward_min).log()
+        # elif self.reward_type == "logconvex":
+        #     log_r = (torch.tensor(prefs) * torch.tensor(rewards).clamp(min=self.reward_min).log()).sum(axis=1)
         return log_r
 
     def _log_candidates(self, candidates, targets, round_idx, log_prefix):
@@ -553,31 +557,24 @@ class MOGFN(object):
 
     def _get_condition_var(self, prefs=None, beta=None, train=True, bs=None):
         if prefs is None:
-            if not train:
-                prefs = self.simplex[0]
-            else:
-                prefs = np.random.dirichlet([self.pref_alpha]*self.obj_dim)
+            prefs = None
+        
         if beta is None:
             if train:
                 beta = float(np.random.randint(1, self.beta_max+1)) if self.beta_cond else self.sample_beta
             else:
                 beta = self.sample_beta
-
-        if self.pref_use_therm:
-            prefs_enc = thermometer(torch.from_numpy(prefs), self.therm_n_bins, 0, 1) 
-        else: 
-            prefs_enc = torch.from_numpy(prefs)
         
         if self.beta_use_therm:
             beta_enc = thermometer(torch.from_numpy(np.array([beta])), self.therm_n_bins, 0, self.beta_max) 
         else:
             beta_enc = torch.from_numpy(np.array([beta]))
         if self.beta_cond:
-            cond_var = torch.cat((prefs_enc.view(-1), beta_enc.view(-1))).float().to(self.device)
+            cond_var = beta_enc.view(-1).float().to(self.device)
+            if bs:
+                cond_var = torch.tile(cond_var.unsqueeze(0), (bs, 1))
         else:
-            cond_var = prefs_enc.view(-1).float().to(self.device)
-        if bs:
-            cond_var = torch.tile(cond_var.unsqueeze(0), (bs, 1))
+            cond_var = None
         return cond_var, (prefs, beta)
 
     def _get_log_prob(self, states, cond_var):

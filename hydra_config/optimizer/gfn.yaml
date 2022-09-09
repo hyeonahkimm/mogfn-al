@@ -1,20 +1,17 @@
-_target_: lambo.optimizers.mogfn_v2.MOGFN
+_target_: lambo.optimizers.gfn.GFN
 _recursive_: False
 num_rounds: 64
 random_action_prob: 0.01
 max_len: ${task.max_len}
 min_len: ${task.min_len}
-train_batch_size: 128
-reward_min: 1e-80
+train_batch_size: 32
+reward_min: 1e-20
 sampling_temp: 1
-num_opt_steps: 5000
+num_opt_steps: 1000
 beta_use_therm: False
-pref_use_therm: True
 beta_cond: False
-pref_cond: True
 beta_scale: 1
 beta_shape: 32
-pref_alpha: 1.0
 pi_lr: 0.005
 z_lr: 0.01
 wd: 0.0001
@@ -23,18 +20,17 @@ therm_n_bins: 50
 gen_clip: 10
 encoder_obj: mlm
 reward_type: convex
-sample_beta: 16
+sample_beta: 32
 simplex_bins: 20
 eval_freq: 100
 k: 10
 num_eval_samples: 1000
-use_eval_pref: False
 resampling_weight: 1.
 concentrate_pool: 1
 val_batch_size: 64
-share_encoder: True
-freeze_encoder: True
-use_acqf: False
+share_encoder: False
+freeze_encoder: False
+use_acqf: True
 offline_gamma: 0
 
 

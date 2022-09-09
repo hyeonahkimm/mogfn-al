@@ -228,6 +228,7 @@ class LaMBO(object):
             for gen_idx in range(self.num_gens):
                 # select candidate sequences to mutate
                 base_idxs = np.random.choice(np.arange(weights.shape[0]), batch_size, p=weights, replace=True)
+                import pdb;pdb.set_trace();
                 base_candidates = self.active_candidates[base_idxs]
                 base_seqs = np.array([cand.mutant_residue_seq for cand in base_candidates])
                 base_tok_idxs = str_to_tokens(base_seqs, self.encoder.tokenizer)

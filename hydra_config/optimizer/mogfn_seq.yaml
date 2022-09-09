@@ -1,9 +1,9 @@
-_target_: lambo.optimizers.mogfn_v2.MOGFN
+_target_: lambo.optimizers.mogfn_seq.MOGFNSeq
 _recursive_: False
 num_rounds: 64
 random_action_prob: 0.01
 max_len: ${task.max_len}
-min_len: ${task.min_len}
+min_len: 2
 train_batch_size: 128
 reward_min: 1e-80
 sampling_temp: 1
@@ -32,14 +32,14 @@ use_eval_pref: False
 resampling_weight: 1.
 concentrate_pool: 1
 val_batch_size: 64
-share_encoder: True
+share_encoder: False
 freeze_encoder: True
 use_acqf: False
 offline_gamma: 0
 
 
 model:
-  _target_: lambo.models.cond_gfn_transformer.CondGFNTransformer
+  _target_: lambo.models.cond_gfn_transformer.CondSeqTransformer
   max_len: ${task.max_len}
   vocab_size: 26
   num_actions: 21
