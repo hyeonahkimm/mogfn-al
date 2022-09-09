@@ -120,7 +120,12 @@ class CondSeqTransformer(nn.Module):
             self.cond_embed = nn.Linear(cond_dim, num_hid)
             self.Z_mod = nn.Linear(cond_dim, num_hid)
         else:
-            self.output = MLP(num_hid, num_actions, [2 * num_hid, 2 * num_hid], dropout)
+            self.output_pos = MLP(num_hid, 1, [4 * num_hid, 4 * num_hid], dropout)
+            if tie_embedding:
+                self.output_tok = nn.Sequential(nn.LayerNorm(num_hid, eps=0.5))
+            else:
+                self.output_tok = MLP(num_hid, num_actions, [4 * num_hid, 4 * num_hid], dropout)
+            # self.output = MLP(num_hid, num_actions, [2 * num_hid, 2 * num_hid], dropout)
             self.Z_mod = nn.Parameter(torch.ones(num_hid) * 30 / num_hid)
         # self.Z_mod = MLP(cond_dim, num_hid, [num_hid, num_hid], 0.05)
         self.logsoftmax2 = torch.nn.LogSoftmax(2)

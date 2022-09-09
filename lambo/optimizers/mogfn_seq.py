@@ -264,6 +264,7 @@ class MOGFNSeq(object):
             
             print('\n---- optimizing candidates ----')
             train_losses, train_rewards, val_losses = [], [], []
+            start_states = np.random.choice(self.active_seqs, size=self.train_batch_size, replace=True)
             hv, rs, val_loss = 0., np.zeros(self.obj_dim), 0.
             pb = tqdm(range(self.num_opt_steps))
             desc_str = "Evaluation := Reward: {:.3f} HV: {:.3f} | Validation:= Loss {:.3f} | Train := Loss: {:.3f} Rewards: {:.3f}"
@@ -272,7 +273,7 @@ class MOGFNSeq(object):
             
             for i in pb:
                 # import pdb;pdb.set_trace();
-                loss, r = self.train_step(task, self.train_batch_size)
+                loss, r = self.train_step(start_states, task, self.train_batch_size)
                 train_losses.append(loss)
                 train_rewards.append(r)
                 
@@ -287,7 +288,7 @@ class MOGFNSeq(object):
                 pb.set_description(desc_str.format(rs.mean(),hv,val_loss,sum(train_losses[-10:]) / 10 , sum(train_rewards[-10:]) / 10))
             
             # import pdb; pdb.set_trace();
-            new_seqs, r_scores = self.sample_new_pareto_front(task, batch_size)
+            new_seqs, r_scores = self.sample_new_pareto_front(start_states, task, batch_size)
 
             # generate new sequences
             # new_seq_batches = np.stack(new_seq_batches)
@@ -394,16 +395,15 @@ class MOGFNSeq(object):
             )
         return metrics
     
-    def sample_new_pareto_front(self, task, batch_size):
+    def sample_new_pareto_front(self, start_states, task, batch_size):
         new_candidates = []
         r_scores = [] 
         all_rewards = []
         for prefs in self.simplex:
-            cond_var, (_, beta) = self._get_condition_var(prefs=prefs, train=False, bs=self.num_samples)
-            samples, _ = self.sample(self.num_samples, cond_var, train=False)
+            cond_var, (_, beta) = self._get_condition_var(prefs=prefs, train=False, bs=len(start_states))
+            samples, _ = self.sample(start_states, cond_var,len(start_states), train=False)
             rewards = task.score(samples)
             r = self.process_reward(samples, prefs, task, rewards=rewards)
-            
             # topk metrics
             # topk_r, topk_idx = torch.topk(r, self.k)
             # samples = np.array(samples)
@@ -429,9 +429,8 @@ class MOGFNSeq(object):
         w = -np.sum(prefs[None, :] * self.train_split.targets, axis=-1)
         return np.random.choice(self.train_split.inputs, size=size, replace=False, p = np.exp(w) / np.exp(w).sum(0))
 
-    def train_step(self, task, batch_size):
+    def train_step(self, start_states, task, batch_size):
         cond_var, (prefs, beta) = self._get_condition_var(train=True, bs=batch_size)
-        start_states = np.random.choice(self.active_seqs, size=batch_size, replace=True)
         states, logprobs = self.sample(start_states, cond_var, batch_size)
         if self.offline_gamma > 0 and int(self.offline_gamma * batch_size) > 0:
             offline_batch = self.sample_offline_data(int(self.offline_gamma * batch_size), prefs=prefs)
@@ -523,7 +522,7 @@ class MOGFNSeq(object):
             # if active_mask.sum() < 128:
             #     import pdb;pdb.set_trace();
             tok_actions = torch.where(active_mask, tok_actions, x.t()[torch.arange(x.shape[1]), pos_actions])
-            x = x.scatter(0, pos_actions.unsqueeze(1), tok_actions)
+            x = x.scatter(0, pos_actions.unsqueeze(1), tok_actions.unsqueeze(1))
             # x = torch.where()
             # x[pos_actions, active_mask] = tok_actions[active_mask]
             if t > 0:
@@ -543,10 +542,14 @@ class MOGFNSeq(object):
         if rewards is None:
             rewards = task.score(np.array(seqs)).clip(min=self.reward_min)
         # print(seqs)
-        if self.reward_type == "convex":
-            log_r = (torch.tensor(prefs) * (rewards)).sum(axis=1).clamp(min=self.reward_min).log()
-        elif self.reward_type == "logconvex":
-            log_r = (torch.tensor(prefs) * torch.tensor(rewards).clamp(min=self.reward_min).log()).sum(axis=1)
+        if self.pref_cond:
+            if self.reward_type == "convex":
+                log_r = (torch.tensor(prefs) * (rewards)).sum(axis=1).clamp(min=self.reward_min).log()
+            elif self.reward_type == "logconvex":
+                log_r = (torch.tensor(prefs) * torch.tensor(rewards).clamp(min=self.reward_min).log()).sum(axis=1)
+        else:
+            # import pdb; pdb.set_trace();
+            log_r = torch.tensor(rewards).clamp(min=self.reward_min).log()
         return log_r
 
     def _log_candidates(self, candidates, targets, round_idx, log_prefix):
