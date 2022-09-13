@@ -97,7 +97,7 @@ class CondGFNTransformer(nn.Module):
 
 class CondSeqTransformer(nn.Module):
     def __init__(self, num_hid, cond_dim, max_len, vocab_size, num_actions, dropout, num_layers,
-                num_head, use_cond, encoder=None, tie_embedding=True, **kwargs):
+                num_head, use_cond, encoder=None, tie_embedding=False, **kwargs):
         super().__init__()
         self.pos = PositionalEncoding(num_hid, dropout=dropout, max_len=max_len + 2)
         self.use_cond = use_cond

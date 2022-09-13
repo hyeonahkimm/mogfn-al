@@ -1,13 +1,13 @@
 _target_: lambo.optimizers.mogfn_seq.MOGFNSeq
 _recursive_: False
 num_rounds: 64
-random_action_prob: 0.01
-max_len: ${task.max_len}
+random_action_prob: 0.05
+max_len: 20
 min_len: 2
-train_batch_size: 128
+train_batch_size: 16
 reward_min: 1e-20
 sampling_temp: 1
-num_opt_steps: 5000
+num_opt_steps: 1000
 beta_use_therm: False
 pref_use_therm: True
 beta_cond: False
@@ -15,28 +15,27 @@ pref_cond: True
 beta_scale: 1
 beta_shape: 32
 pref_alpha: 1.0
-pi_lr: 0.005
-z_lr: 0.01
+pi_lr: 0.0001
+z_lr: 0.001
 wd: 0.0001
 beta_max: 32
 therm_n_bins: 50
 gen_clip: 10
 encoder_obj: mlm
 reward_type: convex
-sample_beta: 42
+sample_beta: 24
 simplex_bins: 20
 eval_freq: 100
 k: 10
-num_eval_samples: 1000
+num_eval_samples: 20
 use_eval_pref: False
 resampling_weight: 1.
 concentrate_pool: 1
 val_batch_size: 64
 share_encoder: False
-freeze_encoder: True
+freeze_encoder: False
 use_acqf: False
 offline_gamma: 0
-
 
 model:
   _target_: lambo.models.cond_gfn_transformer.CondSeqTransformer

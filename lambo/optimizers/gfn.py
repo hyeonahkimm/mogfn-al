@@ -74,6 +74,7 @@ class GFN(object):
         self.beta_cond = kwargs["beta_cond"]
         self.beta_scale = kwargs["beta_scale"]
         self.beta_shape = kwargs["beta_shape"]
+        self.beta_sched = kwargs["beta_sched"]
         self.beta_max = kwargs["beta_max"]
         self.reward_type = kwargs["reward_type"]
         self.eval_freq = kwargs["eval_freq"]
@@ -146,6 +147,7 @@ class GFN(object):
 
         for round_idx in range(1, self.num_rounds + 1):
             metrics = {}
+            self.sample_beta -= self.beta_sched * (round_idx - 1)
             # import pdb; pdb.set_trace();
             # contract active pool to current Pareto frontier
             if (self.concentrate_pool > 0 and round_idx % self.concentrate_pool == 0) or self.latent_init == 'perturb_pareto':
@@ -364,7 +366,7 @@ class GFN(object):
                 np.concatenate((pareto_targets, new_targets)),
             )
             pareto_seqs = np.array([p_cand.mutant_residue_seq for p_cand in pareto_candidates])
-            self.model.apply(weight_reset)
+            # self.model.apply(weight_reset)
             print('\n new candidates')
             obj_vals = {f'obj_val_{i}': new_targets[:, i].min() for i in range(self.bb_task.obj_dim)}
             print(pd.DataFrame([obj_vals]).to_markdown(floatfmt='.4f'))

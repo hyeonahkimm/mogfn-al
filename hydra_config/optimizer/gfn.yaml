@@ -4,10 +4,10 @@ num_rounds: 64
 random_action_prob: 0.01
 max_len: ${task.max_len}
 min_len: ${task.min_len}
-train_batch_size: 32
+train_batch_size: 64
 reward_min: 1e-20
 sampling_temp: 1
-num_opt_steps: 1000
+num_opt_steps: 250
 beta_use_therm: False
 beta_cond: False
 beta_scale: 1
@@ -20,7 +20,8 @@ therm_n_bins: 50
 gen_clip: 10
 encoder_obj: mlm
 reward_type: convex
-sample_beta: 32
+beta_sched: 2
+sample_beta: 16
 simplex_bins: 20
 eval_freq: 100
 k: 10

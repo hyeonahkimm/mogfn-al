@@ -264,7 +264,11 @@ class MOGFNSeq(object):
             
             print('\n---- optimizing candidates ----')
             train_losses, train_rewards, val_losses = [], [], []
-            start_states = np.random.choice(self.active_seqs, size=self.train_batch_size, replace=True)
+            start_candidates = np.random.choice(self.active_candidates, size=self.train_batch_size, replace=True)
+            eval_start_candidates = self.active_candidates
+
+            eval_start_states = np.array([c.mutant_residue_seq for c in eval_start_candidates])
+            start_states = np.array([c.mutant_residue_seq for c in start_candidates])
             hv, rs, val_loss = 0., np.zeros(self.obj_dim), 0.
             pb = tqdm(range(self.num_opt_steps))
             desc_str = "Evaluation := Reward: {:.3f} HV: {:.3f} | Validation:= Loss {:.3f} | Train := Loss: {:.3f} Rewards: {:.3f}"
@@ -288,7 +292,7 @@ class MOGFNSeq(object):
                 pb.set_description(desc_str.format(rs.mean(),hv,val_loss,sum(train_losses[-10:]) / 10 , sum(train_rewards[-10:]) / 10))
             
             # import pdb; pdb.set_trace();
-            new_seqs, r_scores = self.sample_new_pareto_front(start_states, task, batch_size)
+            new_seqs, r_scores = self.sample_new_pareto_front(eval_start_states, task, batch_size)
 
             # generate new sequences
             # new_seq_batches = np.stack(new_seq_batches)
@@ -312,8 +316,9 @@ class MOGFNSeq(object):
             wandb.log(metrics)
 
             print('\n---- querying objective function ----')
-            new_candidates = np.array([type(self.active_candidates[0])(seq, [], self.tokenizer) for seq in new_seqs])
-            # self.bb_task.make_new_candidates(new_seqs, new_seqs)
+            # import pdb; pdb.set_trace();
+            # new_candidates = np.array([type(self.active_candidates[0])(seq, [], self.tokenizer) for seq in new_seqs])
+            new_candidates = self.bb_task.make_new_candidates(eval_start_candidates, new_seqs)
 
             # filter infeasible candidates
             is_feasible = self.bb_task.is_feasible(new_candidates)
@@ -396,34 +401,70 @@ class MOGFNSeq(object):
         return metrics
     
     def sample_new_pareto_front(self, start_states, task, batch_size):
-        new_candidates = []
-        r_scores = [] 
-        all_rewards = []
-        for prefs in self.simplex:
-            cond_var, (_, beta) = self._get_condition_var(prefs=prefs, train=False, bs=len(start_states))
-            samples, _ = self.sample(start_states, cond_var,len(start_states), train=False)
-            rewards = task.score(samples)
-            r = self.process_reward(samples, prefs, task, rewards=rewards)
-            # topk metrics
-            # topk_r, topk_idx = torch.topk(r, self.k)
-            # samples = np.array(samples)
-            # topk_seq = samples[topk_idx].tolist()
-            # edit_dist = mean_pairwise_distances(topk_seq)
-            # topk_rs.append(topk_r.mean().item())
-            # topk_div.append(edit_dist)
-            
-            # top 1 metrics
-            max_idx = r.argmax()
-            new_candidates.append(samples[max_idx])
-            all_rewards.append(rewards[max_idx])
-            r_scores.append(r.max().item())
+        
+        if self.pref_cond:
+            new_candidates = [[] for _ in range(len(start_states))]
+            r_scores = [[] for _ in range(len(start_states))] 
+            all_rewards = [[] for _ in range(len(start_states))]
+            for prefs in self.simplex:
+                cond_var, (_, beta) = self._get_condition_var(prefs=prefs, train=False, bs=len(start_states))
+                samples, _ = self.sample(start_states, cond_var,len(start_states), train=False)
+                rewards = task.score(samples)
+                r = self.process_reward(samples, prefs, task, rewards=rewards)
+                # topk metrics
+                # topk_r, topk_idx = torch.topk(r, self.k)
+                # samples = np.array(samples)
+                # topk_seq = samples[topk_idx].tolist()
+                # edit_dist = mean_pairwise_distances(topk_seq)
+                # topk_rs.append(topk_r.mean().item())
+                # topk_div.append(edit_dist)
+                
+                for i in range(len(samples)):
+                    new_candidates[i].append(samples[i])
+                    all_rewards[i].append(rewards[i])
+                    r_scores[i].append(r[i].item())
 
-        r_scores = np.array(r_scores)
-        all_rewards = np.array(all_rewards)
-        new_candidates = np.array(new_candidates)
-        print(r_scores.mean())
-        idx = np.argsort(r_scores)[-batch_size:]
-        return new_candidates[idx], r_scores[idx]
+                # top 1 metrics
+                # max_idx = r.argmax()
+                # new_candidates.append(samples[max_idx])
+                # all_rewards.append(rewards[max_idx])
+                # r_scores.append(r.max().item())
+
+            r_scores = np.array(r_scores)
+            all_rewards = np.array(all_rewards)
+            new_candidates = np.array(new_candidates)
+            for i in range(len(start_states)):
+                idx = np.argmax(r_scores[i])
+                gen_samples.append(new_candidates[i][idx])
+                gen_rew.append(r_scores[i][idx])
+            return np.array(gen_samples), np.array(gen_rew)
+        else:
+            new_candidates = [[] for _ in range(len(start_states))]
+            r_scores = [[] for _ in range(len(start_states))] 
+            all_rewards = [[] for _ in range(len(start_states))]
+            for _ in range(self.num_samples):
+                cond_var, (_, beta) = self._get_condition_var(prefs=None, train=False, bs=len(start_states))
+                samples, _ = self.sample(start_states, cond_var,len(start_states), train=False)
+                rewards = task.score(samples).cpu()
+                r = self.process_reward(samples, None, task, rewards=rewards)
+
+                for i in range(len(samples)):
+                    new_candidates[i].append(samples[i])
+                    all_rewards[i].append(rewards[i])
+                    r_scores[i].append(r[i].item())
+            
+            r_scores = np.array(r_scores)
+            all_rewards = np.array(all_rewards)
+            new_candidates = np.array(new_candidates)
+            gen_samples = []
+            gen_rew = []
+            for i in range(len(start_states)):
+                idx = np.argmax(r_scores[i])
+                gen_samples.append(new_candidates[i][idx])
+                gen_rew.append(r_scores[i][idx])
+            # idx = np.argsort(r_scores)[-batch_size:]
+            return np.array(gen_samples), np.array(gen_rew)
+
 
     def sample_offline_data(self, size, prefs):
         w = -np.sum(prefs[None, :] * self.train_split.targets, axis=-1)
@@ -471,28 +512,34 @@ class MOGFNSeq(object):
         return overall_loss / len(self.simplex)
 
     def sample(self, start_states, cond_var=None, episodes=16, train=True):
+        # import pdb; pdb.set_trace();
         states = start_states
         traj_logprob = torch.zeros(episodes).to(self.device)
         if cond_var is None:
             cond_var, _ = self._get_condition_var(train=train, bs=episodes)
         active_mask = torch.ones(episodes).bool().to(self.device)
         x = str_to_tokens(states, self.tokenizer).to(self.device).t()
+        traj_lens = torch.zeros(episodes).long().to(self.device)
         lens = torch.tensor(np.array([len(s) for s in states])).long().to(self.device)
         uniform_pol = torch.empty(episodes).fill_(self.random_action_prob).to(self.device)
         updated = torch.empty(episodes).long().to(self.device)
         for t in (range(self.max_len-2) if episodes > 0 else []):
             # import pdb; pdb.set_trace();
             pos_logits, tok_logits = self.model(x, cond_var, lens=lens, mask=None)
+            
             # tokens in the sequence cannot 
-            tok_logits[:, :, :5] = -1000 # block all special tokens
-            tok_logits[:, 0, 5:] = -1000 # can't change cls to anything
+            # tok_logits[:, 1:, 0] = -1000 # block all special tokens
+            # tok_logits[:, 0, 1:] = -1000 # can't change cls to anything
+            # tok_logits[:, 0, -] = -1000 # can't change cls to anything
+            # import pdb; pdb.set_trace();
             pos_logits[:, lens+1] = -1000 # can't change last token
             pos_logits[x.t() == 0] = -1000
+            
             if t > 0:
                 if t == 1:
                     pos_logits = pos_logits.scatter(1, updated.unsqueeze(1),-1000)    
                 else:
-                    pos_logits = pos_logits.scatter(1, updated,-1000)
+                    pos_logits = pos_logits.scatter(1, updated, -1000)
                 
             if t <= self.min_len:
                 # pos 0 (cls token) indicates stop
@@ -505,24 +552,54 @@ class MOGFNSeq(object):
             pos_actions = pos_dist.sample()
 
             if train and self.random_action_prob > 0:
+                pos_logits_temp = pos_logits.detach().clone() / 100
+                pos_logits_temp[:, lens+1] = -1000 # can't change last token
+                pos_logits_temp[x.t() == 0] = -1000
+                if t > 0:
+                    if t == 1:
+                        pos_logits_temp = pos_logits_temp.scatter(1, updated.unsqueeze(1), -1000)    
+                    else:
+                        pos_logits_temp = pos_logits_temp.scatter(1, updated, -1000)
+                pos_dist_temp = Categorical(logits=pos_logits_temp)
+                pos_actions_temp = pos_dist_temp.sample()
                 uniform_mix = torch.bernoulli(uniform_pol).bool()
-                pos_actions = torch.where(uniform_mix, torch.randint(int(t <= self.min_len), pos_logits.shape[1]-1, (episodes, )).to(self.device), pos_actions)
-            
+                pos_actions = torch.where(uniform_mix, pos_actions_temp, pos_actions)
+                # pos_actions = torch.where(uniform_mix, torch.randint(int(t <= self.min_len), pos_logits.shape[1]-1, (episodes, )).to(self.device), pos_actions)
+            if (pos_actions > lens).any():
+                import pdb; pdb.set_trace();
             tok_logits = tok_logits[torch.arange(tok_logits.shape[0]), pos_actions, :]
-            tok_logits[torch.arange(tok_logits.shape[0]), x.t()[torch.arange(x.shape[1]), pos_actions]] = -1000
+            tok_logits[pos_actions != 0, :1] = -1000 # block all special tokens
+            tok_logits[pos_actions == 0, 1:] = -1000
+            tok_logits[torch.arange(tok_logits.shape[0]), x.t()[torch.arange(x.shape[1]), pos_actions] - 4] = -1000
             tok_dist = Categorical(logits=tok_logits / self.sampling_temp)
             tok_actions = tok_dist.sample()
 
+            if train and self.random_action_prob > 0:
+                tok_logits_temp = tok_logits.detach().clone() / 100
+                tok_logits_temp[pos_actions != 0, :1] = -1000 # block all special tokens
+                tok_logits_temp[pos_actions == 0, 1:] = -1000
+                tok_logits_temp[torch.arange(tok_logits.shape[0]), x.t()[torch.arange(x.shape[1]), pos_actions] - 4] = -1000
+                tok_dist_temp = Categorical(logits=tok_logits_temp)
+                tok_actions_temp = tok_dist_temp.sample()
+                uniform_mix = torch.bernoulli(uniform_pol).bool()
+                tok_actions = torch.where(uniform_mix, tok_actions_temp, tok_actions)
+            if (tok_dist.log_prob(tok_actions) < -1000).any():
+                import pdb; pdb.set_trace();
             log_prob = (pos_dist.log_prob(pos_actions) + tok_dist.log_prob(tok_actions)) * active_mask
-            traj_logprob += log_prob
+            # if (log_prob < -500).any():
+            #     import pdb; pdb.set_trace();
 
+            traj_logprob += log_prob
+            traj_lens += torch.where(active_mask, torch.ones_like(lens), torch.zeros_like(lens))
 
             active_mask = torch.where(active_mask, pos_actions != 0, active_mask)
             # Apply action function
             # if active_mask.sum() < 128:
             #     import pdb;pdb.set_trace();
-            tok_actions = torch.where(active_mask, tok_actions, x.t()[torch.arange(x.shape[1]), pos_actions])
-            x = x.scatter(0, pos_actions.unsqueeze(1), tok_actions.unsqueeze(1))
+            tok_actions = torch.where(active_mask, tok_actions+4, x.t()[torch.arange(x.shape[1]), pos_actions])
+            tok_actions = torch.where(pos_actions==0, x.t()[torch.arange(x.shape[1]), 0], tok_actions)
+            x = x.t().scatter(1, pos_actions.unsqueeze(1), tok_actions.unsqueeze(1)).t()
+            # print((x > 4).sum())
             # x = torch.where()
             # x[pos_actions, active_mask] = tok_actions[active_mask]
             if t > 0:
@@ -536,6 +613,9 @@ class MOGFNSeq(object):
             if active_mask.sum() == 0:
                 break
         states = tokens_to_str(x.t(), self.tokenizer)
+        # print(states, traj_lens, traj_logprob)
+        if [len(s) for s in start_states] != [len(s) for s in states]:
+            import pdb; pdb.set_trace();
         return states, traj_logprob   
 
     def process_reward(self, seqs, prefs, task, rewards=None):
