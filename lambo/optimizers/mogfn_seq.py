@@ -8,6 +8,7 @@ import random
 from tqdm import tqdm
 from torch.nn import functional as F
 from torch.distributions import Categorical
+# import ray
 
 from pymoo.factory import get_performance_indicator
 
@@ -19,6 +20,12 @@ from lambo.models.shared_elements import check_early_stopping
 from lambo.utils import weighted_resampling, DataSplit, update_splits, str_to_tokens, tokens_to_str, safe_np_cat, generate_simplex, thermometer
 from lambo.models.lanmt import corrupt_tok_idxs
 from lambo.candidate import StringCandidate
+
+
+# @ray.remote
+# def create_new_cand(task, base_cands, new_seq):
+#     return task.make_new_candidates(base_cands, new_seq)
+
 
 class MOGFNSeq(object):
     '''
@@ -75,6 +82,7 @@ class MOGFNSeq(object):
         self.beta_shape = kwargs["beta_shape"]
         self.pref_alpha = kwargs["pref_alpha"]
         self.beta_max = kwargs["beta_max"]
+        self.beta_sched = kwargs["beta_sched"]
         self.reward_type = kwargs["reward_type"]
         self.eval_freq = kwargs["eval_freq"]
         self.offline_gamma = kwargs["offline_gamma"]
@@ -145,7 +153,7 @@ class MOGFNSeq(object):
 
         for round_idx in range(1, self.num_rounds + 1):
             metrics = {}
-
+            self.sample_beta -= max(self.beta_sched, 2)
             # contract active pool to current Pareto frontier
             if (self.concentrate_pool > 0 and round_idx % self.concentrate_pool == 0) or self.latent_init == 'perturb_pareto':
                 self.active_candidates, self.active_targets = pareto_frontier(
@@ -318,7 +326,11 @@ class MOGFNSeq(object):
             print('\n---- querying objective function ----')
             # import pdb; pdb.set_trace();
             # new_candidates = np.array([type(self.active_candidates[0])(seq, [], self.tokenizer) for seq in new_seqs])
+            
             new_candidates = self.bb_task.make_new_candidates(eval_start_candidates, new_seqs)
+            # new_candidates = [create_new_cand.remote(self.bb_task, np.array([eval_start_candidates[i]]), np.array([new_seqs[i]])) for i in range(len(eval_start_candidates))]
+            # new_candidates = ray.get(new_candidates)
+            # self.bb_task.make_new_candidates(eval_start_candidates, new_seqs)
 
             # filter infeasible candidates
             is_feasible = self.bb_task.is_feasible(new_candidates)
@@ -401,7 +413,6 @@ class MOGFNSeq(object):
         return metrics
     
     def sample_new_pareto_front(self, start_states, task, batch_size):
-        
         if self.pref_cond:
             new_candidates = [[] for _ in range(len(start_states))]
             r_scores = [[] for _ in range(len(start_states))] 
@@ -433,6 +444,8 @@ class MOGFNSeq(object):
             r_scores = np.array(r_scores)
             all_rewards = np.array(all_rewards)
             new_candidates = np.array(new_candidates)
+            gen_samples = []
+            gen_rew = []
             for i in range(len(start_states)):
                 idx = np.argmax(r_scores[i])
                 gen_samples.append(new_candidates[i][idx])
@@ -525,7 +538,7 @@ class MOGFNSeq(object):
         updated = torch.empty(episodes).long().to(self.device)
         for t in (range(self.max_len-2) if episodes > 0 else []):
             # import pdb; pdb.set_trace();
-            pos_logits, tok_logits = self.model(x, cond_var, lens=lens, mask=None)
+            (pos_logits, tok_logits), (back_pos_logits, back_tok_logits) = self.model(x, cond_var, lens=lens, mask=None)
             
             # tokens in the sequence cannot 
             # tok_logits[:, 1:, 0] = -1000 # block all special tokens
@@ -534,12 +547,16 @@ class MOGFNSeq(object):
             # import pdb; pdb.set_trace();
             pos_logits[:, lens+1] = -1000 # can't change last token
             pos_logits[x.t() == 0] = -1000
-            
+            log_pb = torch.zeros(episodes).to(pos_logits.device)
             if t > 0:
                 if t == 1:
                     pos_logits = pos_logits.scatter(1, updated.unsqueeze(1),-1000)    
+                    log_pb_pos = torch.zeros(episodes).to(pos_logits.device)
                 else:
                     pos_logits = pos_logits.scatter(1, updated, -1000)
+                    log_pb_pos = torch.log(torch.ones(episodes).to(pos_logits.device) / (updated != 0).sum(1))
+
+                log_pb = log_pb_pos + torch.log(torch.ones_like(log_pb_pos) / self.model_cfg.num_actions)
                 
             if t <= self.min_len:
                 # pos 0 (cls token) indicates stop
@@ -586,10 +603,10 @@ class MOGFNSeq(object):
             if (tok_dist.log_prob(tok_actions) < -1000).any():
                 import pdb; pdb.set_trace();
             log_prob = (pos_dist.log_prob(pos_actions) + tok_dist.log_prob(tok_actions)) * active_mask
-            # if (log_prob < -500).any():
+            
             #     import pdb; pdb.set_trace();
 
-            traj_logprob += log_prob
+            traj_logprob += (log_prob - log_pb)
             traj_lens += torch.where(active_mask, torch.ones_like(lens), torch.zeros_like(lens))
 
             active_mask = torch.where(active_mask, pos_actions != 0, active_mask)

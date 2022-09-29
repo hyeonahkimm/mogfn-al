@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import torch
+import ray
 
 from omegaconf import OmegaConf
 
@@ -26,7 +27,7 @@ def main(config):
                group=config.group_name, name=config.exp_name, tags=config.exp_tags)
     config['job_name'] = wandb.run.name
     config, _ = startup(config)  # random seed is fixed here
-
+    # ray.init(address="auto")
     # if torch.cuda.is_available():
     #     torch.backends.cudnn.benchmark = True
 

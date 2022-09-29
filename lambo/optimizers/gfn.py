@@ -147,7 +147,7 @@ class GFN(object):
 
         for round_idx in range(1, self.num_rounds + 1):
             metrics = {}
-            self.sample_beta -= self.beta_sched * (round_idx - 1)
+            self.sample_beta -= max(self.beta_sched, 1)
             # import pdb; pdb.set_trace();
             # contract active pool to current Pareto frontier
             if (self.concentrate_pool > 0 and round_idx % self.concentrate_pool == 0) or self.latent_init == 'perturb_pareto':
