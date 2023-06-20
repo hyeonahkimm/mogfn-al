@@ -11,7 +11,7 @@ num_opt_steps: 1000
 beta_use_therm: False
 pref_use_therm: True
 beta_cond: False
-pref_cond: True
+pref_cond: False
 beta_scale: 1
 beta_shape: 32
 pref_alpha: 1.0
@@ -34,7 +34,7 @@ concentrate_pool: 1
 val_batch_size: 64
 share_encoder: False
 freeze_encoder: False
-use_acqf: False
+use_acqf: True
 offline_gamma: 0
 beta_sched: 2
 

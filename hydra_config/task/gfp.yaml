@@ -1,0 +1,11 @@
+_target_: lambo.tasks.gfp.GFPTask
+obj_dim: 1
+log_prefix: gfp
+min_len: 239
+max_len: 239
+num_start_examples: 5000
+batch_size: 128
+max_num_edits: null
+max_ngram_size: 1
+allow_len_change: True
+max_score_per_dim: 1
