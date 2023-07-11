@@ -121,7 +121,6 @@ class MOGFNSeq(object):
         )
         new_seqs = all_seqs.copy()
         new_targets = all_targets.copy()
-        import pdb; pdb.set_trace();
         is_feasible = self.bb_task.is_feasible(candidate_pool)
         pool_candidates = candidate_pool[is_feasible]
         pool_targets = pool_targets[is_feasible]

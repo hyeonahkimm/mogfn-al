@@ -14,7 +14,7 @@ project_name: lambo
 version: v0.2.1
 
 # Directories for loading and storing data
-data_dir: /home/mila/m/moksh.jain/scratch/lambo
+data_dir: ../scratch/lambo
 project_dir: /home/mila/m/moksh.jain/lambo
 exp_name: test
 group_name: somedetails
