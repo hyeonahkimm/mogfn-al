@@ -59,7 +59,6 @@ class ChemTask(Problem):
     def task_setup(self, *args, **kwargs):
         mod = ChemWrapperModule(self.num_start_examples, self.worst_ratio, self.best_ratio)
         all_seqs, all_targets = mod.sample_dataset(self.obj_properties)
-        import pdb; pdb.set_trace();
         if isinstance(self.tokenizer, SELFIESTokenizer):
             all_seqs = np.array(
                 list(map(sf.encoder, all_seqs))

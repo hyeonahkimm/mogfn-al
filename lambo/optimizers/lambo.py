@@ -228,7 +228,6 @@ class LaMBO(object):
             for gen_idx in range(self.num_gens):
                 # select candidate sequences to mutate
                 base_idxs = np.random.choice(np.arange(weights.shape[0]), batch_size, p=weights, replace=True)
-                import pdb;pdb.set_trace();
                 base_candidates = self.active_candidates[base_idxs]
                 base_seqs = np.array([cand.mutant_residue_seq for cand in base_candidates])
                 base_tok_idxs = str_to_tokens(base_seqs, self.encoder.tokenizer)
@@ -305,7 +304,6 @@ class LaMBO(object):
                     else:
                         raise ValueError
 
-                    # import pdb; pdb.set_trace();
                     lat_acq_vals = acq_fn(pooled_features.unsqueeze(0))
                     loss = -lat_acq_vals.mean() + self.entropy_penalty * logit_entropy.mean()
 
@@ -315,7 +313,6 @@ class LaMBO(object):
                         lr_sched.step(loss)
 
                     tgt_seqs = tokens_to_str(tgt_tok_idxs, self.encoder.tokenizer)
-                    # import pdb; pdb.set_trace();
                     act_acq_vals = acq_fn(tgt_seqs[None, :]).mean().item()
 
                     best_score, best_step, _, stop = check_early_stopping(
@@ -350,7 +347,6 @@ class LaMBO(object):
             base_seqs = np.array([b_cand.mutant_residue_seq for b_cand in base_candidates])
             new_seqs = new_seq_batches[best_batch_idx]
             # new_tokens = new_tok_batches[best_batch_idx]
-            # import pdb; pdb.set_trace();
 
             # logging
             metrics = dict(

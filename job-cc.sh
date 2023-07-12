@@ -9,10 +9,6 @@
 module load python/3.8 cuda/11.1
 export PYTHONUNBUFFERED=1
 
-# source /home/mila/m/moksh.jain/lambo/env/bin/activate
-# export PATH=$PATH:$(pwd)
-# pip install ml
-
 module load python/3.8
 cd $SLURM_TMPDIR/
 virtualenv --no-download venv

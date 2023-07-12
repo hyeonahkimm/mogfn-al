@@ -80,7 +80,6 @@ class qDiscreteNEHVI(qNoisyExpectedHypervolumeImprovement):
         # to ensure that we properly sample `f(X)` from the joint distribution `
         # `f(X_baseline, X) ~ P(f | D)` given that we can already fixed the sampled
         # function values for `f(X_baseline)`
-        # import pdb; pdb.set_trace();
         posterior = self.model.posterior(X_full)
         q = X.shape[-2]
         self._set_sampler(q=q, posterior=posterior)
