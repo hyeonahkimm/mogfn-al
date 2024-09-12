@@ -100,6 +100,11 @@ class MOGFNSeq(object):
         freeze_encoder = kwargs.get("freeze_encoder", False)
         self.use_acqf = kwargs.get("use_acqf", False)
         
+        ## Hyeonah
+        self.use_trust_region = kwargs.get("use_trust_region", False)
+        self.min_radius = kwargs.get("min_radius", 0.1)
+        self.region_decay = kwargs.get("region_decay", 1.1)
+        
         self.model_cfg = model
         self.model = hydra.utils.instantiate(model, cond_dim=cond_dim, use_cond=(self.beta_cond or self.pref_cond),
                                              encoder=self.encoder if share_encoder else None)
@@ -153,6 +158,7 @@ class MOGFNSeq(object):
         for round_idx in range(1, self.num_rounds + 1):
             metrics = {}
             self.sample_beta -= max(self.beta_sched, 2)
+            # import pdb; pdb.set_trace();
             # contract active pool to current Pareto frontier
             if (self.concentrate_pool > 0 and round_idx % self.concentrate_pool == 0) or self.latent_init == 'perturb_pareto':
                 self.active_candidates, self.active_targets = pareto_frontier(
@@ -598,9 +604,13 @@ class MOGFNSeq(object):
                 tok_dist_temp = Categorical(logits=tok_logits_temp)
                 tok_actions_temp = tok_dist_temp.sample()
                 uniform_mix = torch.bernoulli(uniform_pol).bool()
+                tok_actions_bck = tok_actions.clone()
                 tok_actions = torch.where(uniform_mix, tok_actions_temp, tok_actions)
             if (tok_dist.log_prob(tok_actions) < -1000).any():
-                import pdb; pdb.set_trace();
+                # import pdb; pdb.set_trace();
+                uniform_mix = torch.bernoulli(uniform_pol).bool()
+                tok_actions = torch.where(uniform_mix, tok_actions_temp, tok_actions_bck)
+                
             log_prob = (pos_dist.log_prob(pos_actions) + tok_dist.log_prob(tok_actions)) * active_mask
             
             #     import pdb; pdb.set_trace();
